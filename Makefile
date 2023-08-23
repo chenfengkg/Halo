@@ -1,5 +1,7 @@
 CXX = g++
-CFLAGS = -std=c++17 -O3 -march=native -L./ -I./Halo
+CFLAGS = -std=c++17 -O3 -march=native -L./ -I./Halo 
+# CFLAGS = -std=c++17 -O0 -g -march=native -L./ -I./Halo 
+
 CURR := $(shell pwd)
 CCEH_F := $(CFLAGS) -DCCEHT -std=c++17 -O3 -march=native \
 	-L./third/pmdk/src/nondebug \
@@ -18,7 +20,7 @@ PCM := -I./pcm -L./pcm
 
 CFLAGS_PMDK := -std=c++17 -O3 -I./ -L./
 
-tar = HALO CCEH DASH CLEVEL PCLHT VIPER SOFT CLHT
+tar = HLSH HALO CCEH DASH CLEVEL PCLHT VIPER SOFT CLHT
 
 all: $(tar)
 
@@ -26,6 +28,10 @@ $(tar): LIBPCM
 
 LIBPCM:
 	make -C pcm
+
+libHlsh.a: Hlsh/*.h
+	$(CXX) $(CFLAGS) -c -o libHlsh.o $<
+	ar rv libHlsh.a libHlsh.o
 
 libHalo.a: Halo/Halo.cpp Halo/Halo.hpp Halo/Pair_t.h
 	$(CXX) $(CFLAGS) -c -o libHalo.o $<
@@ -44,7 +50,10 @@ libCLHT.a: third/CLHT/src/clht_lb_res.c
 	ar rv libCLHT.a libCLHT.o 
 
 
-HALO: benchmark.cpp libHalo.a hash_api.h
+HLSH: benchmark.cpp libHlsh.a hash_api.h
+	$(CXX) -DHLSHT $(CFLAGS) $(PCM) -o $@ $< -pthread -mavx -lPCM -lpmem 
+
+HALO: benchmark.cpp libHalo.a hash_api.h 
 	$(CXX) -DHALOT $(CFLAGS) $(PCM) -o $@ $< -lHalo -pthread -mavx -lPCM -lpmem
 
 PCLHT: benchmark.cpp libPCLHT.a hash_api.h

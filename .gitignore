@@ -30,6 +30,24 @@
 *.exe
 *.out
 *.app
+HALO
+CCEH
+DASH
+CLEVEL
+VIPER
+SOFT
+HLSH
+PCLHT
+
+
+# workload 
+PiBench/
+YCSB/
+
+# perf
+perf.*
+
+
 
 .vscode
 *.DS_Store

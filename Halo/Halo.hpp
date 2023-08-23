@@ -117,6 +117,7 @@ struct root {
   int clean;
   std::mutex mtx;
 };
+
 struct PAGE_METADATA {
   size_t PAGEID;
   size_t LOCAL_OFFSET;
@@ -162,6 +163,7 @@ class MemoryManager {
   size_t local_offset;
   static atomic_size_t PAGE_ID;
 };
+
 class PM_MemoryManager : public MemoryManager {
  public:
   bool workthread;
@@ -177,6 +179,7 @@ class PM_MemoryManager : public MemoryManager {
   static size_t PAGE_ID;
   static mutex mtx;
 };
+
 class DRAM_MemoryManager : public MemoryManager {
  public:
   DRAM_MemoryManager(int id, size_t version) {
@@ -287,6 +290,7 @@ struct Segment {
     uint8_t padding[2 * CACHE_LINE_SIZE];
   };
 } ALIGNED(CACHE_LINE_SIZE);
+
 struct CLHT {
   union {
     struct {
@@ -301,6 +305,7 @@ struct CLHT {
     };
     uint8_t padding[2 * CACHE_LINE_SIZE];
   };
+
   uint8_t TRYLOCK_ACQ(volatile uint8_t *addr) {
     uint8_t oldval;
     __asm__ __volatile__("xchgb %0,%1"
@@ -695,6 +700,7 @@ struct CLHT {
       bucket = (Bucket *)get_DPage_addr(bucket->next);
     } while (true);
   }
+  
   int ht_resize_pes(int is_increase, int by) {
     Segment *ht_old = table;
 
@@ -727,6 +733,7 @@ struct CLHT {
     TRYLOCK_RLS(resize_lock);
     return 1;
   }
+
   int bucket_cpy(volatile Bucket *bucket, Segment *ht_new) {
     if (!LOCK_ACQ_RES(&bucket->lock)) {
       return 0;
@@ -1025,6 +1032,7 @@ class Halo {
     }
     load_factor();
   }
+
   ~Halo() {
     for (auto &&i : reclaim_threads) i.join();
     memory_manager_Pool.shutdown(clhts);

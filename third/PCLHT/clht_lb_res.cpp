@@ -13,7 +13,7 @@
 namespace PCLHT {
 unsigned long PM_POOL_SZ = 32UL * 1024 * 1024 * 1024;
 #define kCacheLineSize 64
-std::string PMEM_LOC = "/mnt/pmem/";
+std::string PMEM_LOC = "/data/pmem0/";
 #define CLHT_READ_ONLY_FAIL 1
 #define CLHT_HELP_RESIZE 1
 #define CLHT_PERC_EXPANSIONS 1

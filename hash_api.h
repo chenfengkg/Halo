@@ -1,6 +1,91 @@
 #include <string>
 constexpr size_t pool_size = 1024ul * 1024ul * 1024ul * 128ul;
-std::string index_pool_name = "/mnt/pmem/hash/";
+std::string index_pool_name = "/data/pmem0/";
+
+#ifdef HLSHT
+#define NONVAR 1
+// #define VARVALUE 1
+#include "Hlsh/hlsh_baseline.h"
+using namespace HLSH_hashing;
+class hash_api {
+ public:
+#ifdef NONVAR
+  HLSH<size_t, size_t> *t;
+#elif VARVALUE
+  HLSH<size_t, std::string> *t;
+#else
+  HLSH<std::string, std::string> *t;
+#endif
+  hash_api(size_t sz = 1024 * 16) {
+    std::string hlsh = index_pool_name + "HLSH.data";
+    size_t hlsh_pool_size = 16ul * 1024ul * 1024Ul * 1024ul;
+    if(FileExists(hlsh.c_str())) FileRemove(hlsh.c_str());
+#ifdef NONVAR
+    t = new HLSH<size_t, size_t>(sz, hlsh.c_str(), hlsh_pool_size);
+#elif VARVALUE
+    t = new HLSH<size_t, std::string>(sz, hlsh.c_str(), hlsh_pool_size);
+#else
+    t = new HLSH<std::string, std::string>(sz, hlsh.c_str(), hlsh_pool_size);
+#endif
+  }
+  ~hash_api() { delete t; }
+  std::string hash_name() { return "HLSH"; };
+  bool find(size_t key, void *p) {
+#ifdef NONVAR
+    auto pt = reinterpret_cast<Pair_t<size_t, size_t> *>(p);
+    pt->set_key(key);
+#elif VARVALUE
+    auto pt = reinterpret_cast<Pair_t<size_t, std::string> *>(p);
+    pt->set_key(key);
+#else
+    auto pt = reinterpret_cast<Pair_t<std::string, std::string> *>(p);
+    pt->set_key(reinterpret_cast<char *>(&key), 8);
+#endif
+    return t->Get(pt);
+  }
+  bool insert(size_t key, size_t value_len, char *value, int tid = 0,
+              int *r = nullptr) {
+#ifdef NONVAR
+    Pair_t<size_t, size_t> p(key, *reinterpret_cast<size_t *>(value));
+#elif VARVALUE
+    Pair_t<size_t, std::string> p(key, value, value_len);
+#else
+    Pair_t<std::string, std::string> p(reinterpret_cast<char *>(&key), 8, value,
+                                       value_len);
+#endif
+    return t->Insert(&p, tid);
+  }
+  bool update(size_t key, size_t value_len, char *value, int tid = 0,
+              int *r = nullptr) {
+#ifdef NONVAR
+    Pair_t<size_t, size_t> p(key, *reinterpret_cast<size_t *>(value));
+#elif VARVALUE
+    Pair_t<size_t, std::string> p(key, value, value_len);
+#else
+    Pair_t<std::string, std::string> p(reinterpret_cast<char *>(&key), 8, value,
+                                       value_len);
+#endif
+    return t->Update(&p, tid);
+  }
+
+  bool erase(size_t key, int tid = 0) {
+#ifdef NONVAR
+    Pair_t<size_t, size_t> p;
+    p.set_key(key);
+#elif VARVALUE
+    Pair_t<size_t, std::string> p;
+    p.set_key(key);
+#else
+    Pair_t<std::string, std::string> p;
+    p.set_key(reinterpret_cast<char *>(&key), 8);
+#endif
+    t->Delete(&p, tid);
+    return true;
+  }
+  void wait() {}
+  void load_factor() {}
+};
+#endif
 
 #ifdef HALOT
 #define NONVAR 1
@@ -17,7 +102,7 @@ class hash_api {
   Halo<std::string, std::string> *t;
 #endif
   hash_api(size_t sz = 16 * 1024 * 1024) {
-    PM_PATH = "/mnt/pmem/hash/HaLo/";
+    PM_PATH = "/data/pmem0/hash/HaLo/";
 #ifdef NONVAR
     t = new Halo<size_t, size_t>(sz);
 #elif VARVALUE
@@ -84,6 +169,7 @@ class hash_api {
   void load_factor() { t->load_factor(); }
 };
 #endif
+
 #ifdef CCEHT
 #include "third/CCEH/CCEH_baseline.h"
 class hash_api {
@@ -196,7 +282,7 @@ class hash_api {
 
  public:
   hash_api(size_t sz = 1024 * 16, int tnum = 32) {
-    const char *path = "/mnt/pmem/pmem.data ";
+    const char *path = "/data/pmem0/pmem.data ";
     if (!std::filesystem::exists(path))
       pop =
           nvobj::pool<root>::create(path, LAYOUT, pool_size, S_IWUSR | S_IRUSR);

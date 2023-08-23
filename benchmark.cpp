@@ -127,7 +127,7 @@ void run_test(workload_type wlt, int num_thread, string load_data,
   }
   RUN_SIZE = count;
 
-#ifdef HALOT
+#if defined(HALOT)||defined(HLSHT)
 #ifdef NONVAR
   Pair_t<size_t, size_t> *p = new Pair_t<size_t, size_t>[RUN_SIZE];
 #elif VARVALUE
@@ -261,7 +261,7 @@ void run_test(workload_type wlt, int num_thread, string load_data,
         rf = h->update(keys[i], value_lens[i], reinterpret_cast<char *>(values),
                        tid, &r[i % 1024]);
       } else if (ops[i] == OP_READ) {
-#ifdef HALOT
+#if defined(HALOT)||defined(HLSHT) 
         rf = h->find(keys[i], &p[i]);
 #else
         rf = h->find(keys[i]);
