@@ -308,6 +308,20 @@ class HLSH {
     /* get key value with option epoch */
     template <class KEY, class VALUE>
     bool HLSH<KEY, VALUE>::Get(Pair_t<KEY, VALUE>* p) {
+        // if(pv.ok!=nullptr){
+        //     auto prep = reinterpret_cast<Pair_t<KEY,VALUE>*>(pv.ok);
+        //     auto bk = reinterpret_cast<Bucket<KEY,VALUE>*>(pv.bk);
+        //     for(auto kp: pv.kp){
+        //         auto t = reinterpret_cast<Pair_t<KEY,VALUE>*>(kp);    
+        //         if(prep->str_key()==t->str_key()){
+        //             if(!bk->lock.LockVersionIsChanged(pv.ov)){
+        //                 prep->load(kp);
+        //                 break;
+        //             }
+        //         }
+        //     }
+        //     pv.Clear();
+        // }
         // s1: caculate hash value for key-value pair
         uint64_t key_hash = h(p->key(),p->klen());
         // s2: obtain segment

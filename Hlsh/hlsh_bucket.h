@@ -23,12 +23,33 @@ namespace HLSH_hashing{
   constexpr size_t kSplitNum = 2;
   constexpr size_t kSplitMask = (1UL << kSplitNum) - 1;
 
+  struct PrefetchValue{
+    char* ok;//origin kv
+    char* bk;//bucket position
+    uint16_t ov; //old version
+    std::vector<char*> kp;// possible key 
+
+    PrefetchValue(){
+      ok = nullptr;
+      bk = nullptr;
+      ov = 0;
+    }
+
+    void Clear(){
+      ok = nullptr;
+      bk = nullptr;
+      ov = 0;
+      kp.clear();
+    }
+  };
+
+  thread_local PrefetchValue pv;
 #define KEY_FINGER(hash) ((hash)&kMask);
 #define BUCKET_INDEX(hash) ((hash >> kFingerBits) & bucketMask)
 #define NEXT_BUCKET(y) (((y) & 1) ? ((y) - 1) : ((y) + 1))
 
 
-  struct _Pair { uint64_t key; PmOffset value; };
+  struct _Pair { uint64_t key; PmOffset value; }__attribute__((packed));
 
   struct ALIGNED(1) StashBitmap {
     uint64_t b;
@@ -52,10 +73,10 @@ namespace HLSH_hashing{
   };
 
   template <class KEY, class VALUE>
-  struct ALIGNED(1) Stash {
-    VersionLock lock;    // 1B
+  struct Stash {
+    VersionLock lock;    // 8B
     StashBitmap bitmap;  // 8B
-    uint8_t pad[30];
+    uint8_t pad[16];
     _Pair _[kStashPairNum];
 
     static size_t GetSlotNum() { return kStashPairNum; }
@@ -115,7 +136,9 @@ namespace HLSH_hashing{
     inline bool Get(Pair_t<KEY, VALUE>* p, uint64_t key_hash, uint64_t pos) {
       if (_[pos].key == key_hash) {
         auto o = _[pos].value;
-        auto addr = o.chunk_start_addr + o.offset;
+        auto addr = reinterpret_cast<char*>(o.chunk_start_addr + o.offset);
+        // pv.kp.push_back(addr);
+        // _mm_prefetch(addr,_MM_HINT_NTA);
         auto v = reinterpret_cast<Pair_t<KEY, VALUE>*>(addr);
         if (v->str_key() == p->str_key()) {
           p->load(reinterpret_cast<char*>(addr));
@@ -139,14 +162,14 @@ namespace HLSH_hashing{
       }
       return rFailure;
     }
-  };
+  }__attribute__((packed));
 
   template <class KEY, class VALUE>
-  struct ALIGNED(1) Bucket {
-    BucketVLock lock;          // 1B
+  struct Bucket {
+    BucketVLock lock;          // 2B
     uint32_t bitmap;           // 4B
-    uint8_t pad[3];            // 3B
-    Stash<KEY, VALUE>* stash;  // 8B
+    uint8_t pad[2];            // 10B
+    Stash<KEY,VALUE>* stash;
     uint8_t fingers[32];       // 0-11: bucket finger, 12-21: stash finger
     uint8_t stash_pos[16];
     _Pair slot[kBucketNormalSlotNum];
@@ -166,8 +189,7 @@ namespace HLSH_hashing{
 
     static size_t GetSlotNum() { return kBucketNormalSlotNum; }
 
-    bool FindDuplicate(Pair_t<KEY, VALUE>* p, uint64_t key_hash,
-                       uint8_t finger) {
+    bool FindDuplicate(Pair_t<KEY, VALUE>* p, uint64_t key_hash, uint8_t finger) {
       // s1: filter invalid records with finger
       uint32_t mask = 0;
       SIMD_CMP8(fingers, finger);
@@ -209,8 +231,8 @@ namespace HLSH_hashing{
 
       // s3: traverse valid record and update kv
       if (mask != 0) {
-        do {
-          auto pos = __builtin_ctz(mask);
+        do{
+        auto pos = __builtin_ctz(mask);
           if (pos < kBucketNormalSlotNum) {
             // s3.1: traverse valid records
             if (slot[pos].key == key_hash) {
@@ -229,8 +251,8 @@ namespace HLSH_hashing{
                                    stash_pos[pos - kBucketNormalSlotNum], pm);
             if (rSuccess == r) return rSuccess;
           }
-          mask = mask & (~(1 << pos));
-        } while (mask);
+          mask = mask &(~(1<<pos));
+          }while(mask);
       }
       return rFailure;
     }
@@ -244,30 +266,34 @@ namespace HLSH_hashing{
 
       // s3: Get value by traversing valid record
       if (mask != 0) {
-        do {
+        // pv.ok = reinterpret_cast<char*>(p);
+        // pv.bk = reinterpret_cast<char*>(this);
+        do{
           auto pos = __builtin_ctz(mask);
           if (pos < kBucketNormalSlotNum) {
             // s3.1: traverse valid records in current bucket
             if (slot[pos].key == key_hash) {
               auto o = slot[pos].value;
-              auto addr = o.chunk_start_addr + o.offset;
+              auto addr = reinterpret_cast<char*>(o.chunk_start_addr + o.offset);
+              // pv.kp.push_back(addr);
+              // _mm_prefetch(addr,_MM_HINT_NTA);
               auto v = reinterpret_cast<Pair_t<KEY, VALUE>*>(addr);
               if (p->str_key() == v->str_key()) {
                 // s3.1.2: return kv only if key is euqal
-                p->load(reinterpret_cast<char*>(addr));
+                p->load(addr);
                 return true;
               }
+              return true;
             }
           } else {
             // s3.2: traverse valid records in stash
-            auto r =
-                stash->Get(p, key_hash, stash_pos[pos - kBucketNormalSlotNum]);
+            auto r = stash->Get(p, key_hash, stash_pos[pos - kBucketNormalSlotNum]);
             if (r) return r;
           }
-          mask = mask & (~(1 << pos));
-        } while (mask);
+          mask = mask &(~(1<<pos));
+        }while(mask);
       }
-
+      
       return false;
     }
 
@@ -387,5 +413,5 @@ namespace HLSH_hashing{
       }
       return rFailure;
     }
-  };
+  }__attribute__((packed));
 }

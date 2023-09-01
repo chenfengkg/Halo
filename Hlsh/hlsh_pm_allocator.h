@@ -32,7 +32,7 @@ namespace HLSH_hashing {
     class HLSH;
 
 
-    struct ALIGNED(1) PmOffset {
+    struct PmOffset {
       uint64_t chunk_start_addr : 49;
       uint64_t offset : 15;
 
@@ -50,7 +50,7 @@ namespace HLSH_hashing {
         chunk_start_addr = c;
         offset = o;
       }
-    };
+    }__attribute__((packed));
 
     PmOffset PO_NULL(0, 0); //NULL offset for PM
 

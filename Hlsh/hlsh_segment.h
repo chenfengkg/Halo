@@ -14,8 +14,8 @@ enum class SplitState : uint8_t {
 
 /* the segment class*/
 template <class KEY, class VALUE>
-struct ALIGNED(1) Segment {
-  VersionLock lock;           // 1B: lock for directory entries
+struct Segment {
+  VersionLock lock;           // 8B: lock for directory entries
   uint64_t pattern: 58;       //8B
   uint64_t local_depth: 6;
   Segment<KEY, VALUE>* next;  // 8B
@@ -40,8 +40,9 @@ struct ALIGNED(1) Segment {
       // s3: update local depth
       t->local_depth = depth;
       t->pattern = pattern;
-      for (size_t i = 0; i < kNumBucket; i++) {
-        t->bucket[i].stash = &t->stash;
+      for(size_t i = 0;i<kNumBucket;i++){
+        auto b = t->bucket+i;
+        b->stash = &t->stash;
       }
     }
   }
@@ -275,6 +276,7 @@ RETRY:
   auto target = bucket + y;
   // s2: get version
   auto old_version = target->lock.GetVersionWithoutLock();
+  // pv.ov = old_version;
   // s3: get and return value from target bucket if value exist
   auto r = target->Get(p, key_hash, finger);
   // s4: retry or return based on return value

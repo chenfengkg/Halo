@@ -14,11 +14,11 @@ namespace HLSH_hashing {
 
         BucketVersionLock() :pad(0) {}
         BucketVersionLock(uint16_t lk) : pad(lk) {}
-    };
+    }__attribute__((packed));
 
     /* 8bit VersionLock: write with lock, read without lock*/
     struct BucketVLock {
-        BucketVersionLock vlock;
+        BucketVersionLock vlock;//2B
 
         BucketVLock() {}
 
@@ -28,7 +28,7 @@ namespace HLSH_hashing {
             vlock.vlock.is_split = 1;
         }
 
-        inline uint64_t GetVersionWithoutLock() {
+        inline uint16_t GetVersionWithoutLock() {
             BucketVersionLock l;
             uint16_t old_value;
             // s1: get vlock without lock
@@ -142,18 +142,19 @@ namespace HLSH_hashing {
             return l.vlock.is_split;
         }
 
-    };
+    }__attribute__((packed));
 
-    const uint8_t lockSet = ((uint8_t)1 << 7);
-    const uint8_t lockMask = ((uint8_t)1 << 7) - 1;
+    const uint64_t lockSet = ((uint64_t)1 << 63);
+    const uint64_t lockMask = lockSet - 1;
+
     struct VersionLock {
-        uint8_t version_lock;
+        uint64_t version_lock;
 
         VersionLock() { version_lock = 0; }
 
         inline void GetLock() {
-            uint8_t new_value = 0;
-            uint8_t old_value = 0;
+            uint64_t new_value = 0;
+            uint64_t old_value = 0;
             do {
                 while (true) {
                     old_value = __atomic_load_n(&version_lock, __ATOMIC_ACQUIRE);
@@ -164,7 +165,7 @@ namespace HLSH_hashing {
         }
 
         inline bool TryGetLock() {
-            uint8_t v = __atomic_load_n(&version_lock, __ATOMIC_ACQUIRE);
+            uint64_t v = __atomic_load_n(&version_lock, __ATOMIC_ACQUIRE);
             if (v & lockSet) { return false; }
             auto old_value = v & lockMask;
             auto new_value = v | lockSet;
@@ -172,22 +173,22 @@ namespace HLSH_hashing {
         }
 
         inline void ReleaseLock() {
-            uint8_t v = version_lock;
+            uint64_t v = version_lock;
             __atomic_store_n(&version_lock, (v + 1) & lockMask, __ATOMIC_RELEASE);
         }
 
         /*if the lock is set, return true*/
-        inline bool TestLockSet(uint8_t& version) {
+        inline bool TestLockSet(uint64_t& version) {
             version = __atomic_load_n(&version_lock, __ATOMIC_ACQUIRE);
             return (version & lockSet) != 0;
         }
 
         // test whether the version has change, if change, return true
-        inline bool TestLockVersionChange(uint8_t old_version) {
+        inline bool TestLockVersionChange(uint64_t old_version) {
             auto value = __atomic_load_n(&version_lock, __ATOMIC_ACQUIRE);
             return (old_version != value);
         }
-    };
+    }__attribute__((packed));
 
     struct ReadShareLock {
         uint32_t lock;  // the MSB is the lock bit; remaining bits are used as the counter
