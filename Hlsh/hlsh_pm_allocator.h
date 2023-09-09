@@ -80,10 +80,11 @@ namespace HLSH_hashing {
         // s2: traverse and insert valid key-value into index
         while (csize < foffset.fo.offset) {
           auto p = reinterpret_cast<Pair_t<KEY, VALUE>*>(chunk_start_addr);
-          if (p->flag) {
-            tl_value.Set(addr + id * kStripeSize, foffset.fo.offset);
-            index->Insert(p, 0, true);
-            recovery_count++;
+          if (p->get_flag() == FLAG_t::VALID)
+          {
+              tl_value.Set(addr + id * kStripeSize, foffset.fo.offset);
+              index->Insert(p, 0, true);
+              recovery_count++;
           }
           csize += p->size();
           chunk_start_addr += p->size();

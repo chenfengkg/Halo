@@ -17,7 +17,10 @@ namespace HLSH_hashing {
         PmOffset Insert(Pair_t<KEY, VALUE>* p) {
           // s1: judge remain space is enough to accomodate the key-value pair
           auto len = p->size();
-          if ((kChunkSize - offset) < len) return PmOffset(kInvalidAddr, 0);
+          if ((kChunkSize - offset) < len){
+              clwb_sfence(reinterpret_cast<char *>(start_addr), sizeof(PmChunk<KEY, VALUE>));
+              return PmOffset(kInvalidAddr, 0);
+          }
           // s2: obtain the insertion address
           p->store_persist(reinterpret_cast<char*>(start_addr + offset));
           // s3: construct PM offset
@@ -209,10 +212,10 @@ namespace HLSH_hashing {
             // s1: insert new key-value with higher version into the pm
             auto op = reinterpret_cast<Pair_t<KEY, VALUE>*>(
                 po.chunk_start_addr + po.offset);
-            p->set_version(op->version);
+            p->set_version(op->get_version() + 1);
             auto pf = Insert(p, tid);
             // s2: remove old key-value
-            op->flag = FLAG_t::INVALID;
+            op->set_flag(FLAG_t::INVALID);
             clwb_sfence(reinterpret_cast<char*>(op), sizeof(FLAG_VERSION));
             // s3: free space for old key-value
             auto chunk =
@@ -229,7 +232,7 @@ namespace HLSH_hashing {
             // s1: invalid and persist flag
             auto p = reinterpret_cast<Pair_t<KEY, VALUE>*>(po.chunk_start_addr +
                                                            po.offset);
-            p->flag = FLAG_t::INVALID;
+            p->set_flag(FLAG_t::INVALID);
             clwb_sfence(reinterpret_cast<char*>(p), sizeof(FLAG_VERSION));
             // s2: increase and persist free size
             auto chunk =

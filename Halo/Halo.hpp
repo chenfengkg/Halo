@@ -1043,6 +1043,24 @@ class Halo {
       memory_manager_Pool.get_PM_MemoryManager(&mmanager);
     auto hkey = hash_func(reinterpret_cast<void *>(p.key()), p.klen());
     auto addr = get_PM_addr(hkey);
+    // if (addr == nullptr) {
+    //   auto len = p.size();
+    //   auto &pm = mmanager;
+    //   auto offset_and_addr = pm.halloc(len);
+    //   // auto offset = offset_and_addr.first;
+    //   auto addr = offset_and_addr.second;
+    //   auto add = reinterpret_cast<long long *>(&p);
+    //   auto paddr = reinterpret_cast<long long *>(addr);
+    //   pmem_memcpy_persist(paddr, add, len);
+    //   pmem_drain();
+    //   pm.update_metadata();
+    //   auto n = GET_CLHT_INDEX(hkey, TABLE_NUM);
+    //   clhts[n]->clht_put(hkey, offset);
+    //   return true;
+    // }
+    // else {
+    //   return true;
+    // }
     // check if the key exists
     if (addr != nullptr) {
       *r = EXIST;
@@ -1072,6 +1090,7 @@ class Halo {
       return true;
     }
   }
+
   bool Update(Pair_t<KEY, VALUE> &p, int *r) {
     if (Unlikely(mmanager.ID == -1))
       memory_manager_Pool.get_PM_MemoryManager(&mmanager);
@@ -1085,6 +1104,7 @@ class Halo {
     }
     return true;
   }
+
   bool Get(Pair_t<KEY, VALUE> *p) {
     if (Unlikely(READ_BUFFER_SIZE == 1)) {
       auto hkey = hash_func(reinterpret_cast<void *>(p->key()), p->klen());
@@ -1222,18 +1242,18 @@ class Halo {
         p->set_empty();
     }
     // load
-    for (size_t i = 0; i < READ_BUFFER_SIZE; i++) {
-      if (!addrs[i]) {
-        continue;
-      }
-      auto r = reinterpret_cast<Pair_t<KEY, VALUE> *>(BUFFER_READ[i]);
-      auto p = reinterpret_cast<Pair_t<KEY, VALUE> *>(addrs[i]);
-      // cout << r->str_key() << "!" << p->str_key() << " " << p->value() <<
-      // endl;
-      if (r->str_key() != p->str_key()) cout << "ERROR!" << endl;
-      r->load(addrs[i]);
-      if (r->get_op() == OP_t::DELETED) r->set_empty();
-    }
+    // for (size_t i = 0; i < READ_BUFFER_SIZE; i++) {
+    //   if (!addrs[i]) {
+    //     continue;
+    //   }
+    //   auto r = reinterpret_cast<Pair_t<KEY, VALUE> *>(BUFFER_READ[i]);
+    //   auto p = reinterpret_cast<Pair_t<KEY, VALUE> *>(addrs[i]);
+    //   // cout << r->str_key() << "!" << p->str_key() << " " << p->value() <<
+    //   // endl;
+    //   if (r->str_key() != p->str_key()) cout << "ERROR!" << endl;
+    //   r->load(addrs[i]);
+    //   if (r->get_op() == OP_t::DELETED) r->set_empty();
+    // }
     BUFFER_READ_COUNTER = 0;
   }
 

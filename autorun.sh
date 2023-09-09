@@ -20,7 +20,7 @@ for w in ycsbd
 do
     for t in 32
     do  
-        for h in HLSH 
+        for h in HLSH
         do
             numactl -N 0 ./$h $w $t
             rm /data/pmem0/*.data -rf

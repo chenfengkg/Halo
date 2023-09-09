@@ -52,6 +52,7 @@ libCLHT.a: third/CLHT/src/clht_lb_res.c
 
 HLSH: benchmark.cpp libHlsh.a hash_api.h
 	$(CXX) -DHLSHT $(CFLAGS) $(PCM) -o $@ $< -pthread -mavx -lPCM -lpmem 
+	# $(CXX) -DHLSHT -DENABLE_PREALLOC $(CFLAGS) $(PCM) -o $@ $< -pthread -mavx -lPCM -lpmem 
 
 HALO: benchmark.cpp libHalo.a hash_api.h 
 	$(CXX) -DHALOT $(CFLAGS) $(PCM) -o $@ $< -lHalo -pthread -mavx -lPCM -lpmem

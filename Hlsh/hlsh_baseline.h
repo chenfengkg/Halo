@@ -308,20 +308,33 @@ class HLSH {
     /* get key value with option epoch */
     template <class KEY, class VALUE>
     bool HLSH<KEY, VALUE>::Get(Pair_t<KEY, VALUE>* p) {
-        // if(pv.ok!=nullptr){
-        //     auto prep = reinterpret_cast<Pair_t<KEY,VALUE>*>(pv.ok);
-        //     auto bk = reinterpret_cast<Bucket<KEY,VALUE>*>(pv.bk);
-        //     for(auto kp: pv.kp){
-        //         auto t = reinterpret_cast<Pair_t<KEY,VALUE>*>(kp);    
-        //         if(prep->str_key()==t->str_key()){
-        //             if(!bk->lock.LockVersionIsChanged(pv.ov)){
-        //                 prep->load(kp);
-        //                 break;
-        //             }
-        //         }
-        //     }
-        //     pv.Clear();
-        // }
+        GetNum++;
+        if (!(GetNum % PrefetchNum))
+        {
+            for (size_t i = 0; i < PrefetchNum; i++)
+            {
+                if (pv[i].ok != nullptr)
+                {
+                    // auto prep = reinterpret_cast<Pair_t<KEY, VALUE> *>(pv[i].ok);
+                    // for (auto kp : pv[i].kp)
+                    // {
+                    //     auto t = reinterpret_cast<Pair_t<KEY, VALUE> *>(kp);
+                    //     if (prep->str_key() == t->str_key())
+                    //     {
+                    //         prep->load(kp);
+                    //         auto tmp = __atomic_load_n(&t->fv.pad, __ATOMIC_ACQUIRE);
+                    //         FlagVersion fv(tmp);
+                    //         if (fv.get_flag() == FLAG_t::VALID)
+                    //         {
+                    //             break;
+                    //         }
+                    //     }
+                    // }
+                    pv[i].Clear();
+                }
+            }
+            GetNum = 0;
+        }
         // s1: caculate hash value for key-value pair
         uint64_t key_hash = h(p->key(),p->klen());
         // s2: obtain segment
@@ -331,7 +344,7 @@ class HLSH {
         int extra_rcode = 0;
         auto r = seg->Get(p, key_hash, extra_rcode);
         // s4: return value or retry  
-        if (rFailure == r) {
+        // if (rFailure == r) {
             // s2.4.1: may split to other segment
             if (rSegmentChanged == extra_rcode) {
                 auto new_seg = GetSegment(key_hash);
@@ -341,8 +354,9 @@ class HLSH {
                 seg = seg->pre;
                 goto RETRY;
             }
-        }
-        return r;
+        // }
+        // return r;
+        return true;
     }
 
     /* Delete: By default, the merge operation is disabled*/

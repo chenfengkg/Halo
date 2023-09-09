@@ -40,9 +40,10 @@ struct Segment {
       // s3: update local depth
       t->local_depth = depth;
       t->pattern = pattern;
+      auto stash = reinterpret_cast<uint64_t>(&t->stash);
       for(size_t i = 0;i<kNumBucket;i++){
         auto b = t->bucket+i;
-        b->stash = &t->stash;
+        b->stash_offset = reinterpret_cast<uint64_t>(b)-stash;
       }
     }
   }
@@ -60,8 +61,6 @@ struct Segment {
     // s3: update local depth
     t->local_depth = depth;
     t->pattern = pattern;
-
-    AddSlots(GetSlotNum());
 #else
     New(tbl, depth, p_next, pattern);
 #endif
@@ -70,7 +69,9 @@ struct Segment {
   Segment() {
     // set stash value to bucket
     for (size_t i = 0; i < kNumBucket; i++) {
-      bucket[i].stash = &stash;
+      auto b = bucket + i;
+      b->stash_offset = (uint16_t)(reinterpret_cast<uint64_t>(this) -
+                        reinterpret_cast<uint64_t>(&stash));
     }
   }
 
@@ -276,16 +277,15 @@ RETRY:
   auto target = bucket + y;
   // s2: get version
   auto old_version = target->lock.GetVersionWithoutLock();
-  // pv.ov = old_version;
   // s3: get and return value from target bucket if value exist
   auto r = target->Get(p, key_hash, finger);
   // s4: retry or return based on return value
-  if (rSuccess != r) {
-    //  s4.1: retry if version change or return
-    if (target->lock.LockVersionIsChanged(old_version)) {
-      goto RETRY;
-    }
-  } else {
+  // if (rSuccess != r) {
+  //   //  s4.1: retry if version change or return
+  //   if (target->lock.LockVersionIsChanged(old_version)) {
+  //     goto RETRY;
+  //   }
+  // } else {
     // s4.2: two case need to retry: 1: segment is changed 2. bucket is not
     // split
     auto old_value = __atomic_load_n(&target->lock.vlock.pad, __ATOMIC_ACQUIRE);
@@ -298,7 +298,7 @@ RETRY:
       // s4.2.1: value may exist previous segment
       extra_rcode = rPreSegment;
     }
-  }
+  // }
   return r;
 }
 
@@ -348,6 +348,7 @@ int Segment<KEY, VALUE>::SplitBucket(Bucket<KEY, VALUE>* target,
   /* s4: traverse bucket and move valid records to new segment*/
   // s4.1: determin split bucket and new bucket
   Bucket<KEY, VALUE>*split_bucket, *new_bucket;
+  Stash<KEY,VALUE>*split_stash = &split_seg->stash,*new_stash = &new_seg->stash;
   if (l.vlock.is_split_seg) {
     split_bucket = target;
     new_bucket = lock_bucket;
@@ -374,12 +375,12 @@ int Segment<KEY, VALUE>::SplitBucket(Bucket<KEY, VALUE>* target,
   for (size_t j = kBucketNormalSlotNum; j < kBucketTotalSlotNum; j++) {
     if (CHECK_BIT(split_bucket->bitmap, j)) {
       auto pos = split_bucket->stash_pos[j - kBucketNormalSlotNum];
-      auto key_hash = split_bucket->stash->_[pos].key;
+      auto key_hash = split_stash->_[pos].key;
       if ((key_hash >> (64 - new_seg->local_depth)) == new_seg->pattern) {
         invalid_mask = invalid_mask | ((uint32_t)1 << j);
         invalid_mask_stash = invalid_mask_stash | (1UL << pos);
-        new_bucket->Insert(split_bucket->stash->_[pos].key,
-                           split_bucket->stash->_[pos].value,
+        new_bucket->Insert(split_stash->_[pos].key,
+                           split_stash->_[pos].value,
                            split_bucket->fingers[j]);
       }
     }
@@ -387,9 +388,9 @@ int Segment<KEY, VALUE>::SplitBucket(Bucket<KEY, VALUE>* target,
 
   // s5: clear bucket and stash metadata
   split_bucket->bitmap = split_bucket->bitmap & (~invalid_mask);
-  split_bucket->stash->lock.GetLock();
-  split_bucket->stash->bitmap.ClearBits(invalid_mask_stash);
-  split_bucket->stash->lock.ReleaseLock();
+  split_stash->lock.GetLock();
+  split_stash->bitmap.ClearBits(invalid_mask_stash);
+  split_stash->lock.ReleaseLock();
 
   // split_bucket->BkLoadFactor(false);
   // new_bucket->BkLoadFactor(false);

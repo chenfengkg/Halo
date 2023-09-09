@@ -31,18 +31,18 @@ struct Directory {
   static void New(Directory<KEY, VALUE>** dir, size_t cap, size_t version,
                   Directory<KEY, VALUE>* odir,
                   DirectoryAllocator<KEY, VALUE>* dalloc) {
-#ifdef ENABLE_PREALLOC
-    // s1: get new directory from preallocated memory block
-    (*dir) = dalloc->Get();
-    // s2: set metadata
-    auto d = *dir;
-    d->global_depth = static_cast<size_t>(log2(cap));
-    d->capacity = cap;
-    d->version = version;
-    d->old_dir = odir;
-#else
+// #ifdef ENABLE_PREALLOC
+//     // s1: get new directory from preallocated memory block
+//     (*dir) = dalloc->Get();
+//     // s2: set metadata
+//     auto d = *dir;
+//     d->global_depth = static_cast<size_t>(log2(cap));
+//     d->capacity = cap;
+//     d->version = version;
+//     d->old_dir = odir;
+// #else
     New(dir, cap, version, odir);
-#endif
+// #endif
   }
 };
 }  // namespace HLSH_hashing

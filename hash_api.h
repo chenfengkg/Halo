@@ -47,6 +47,8 @@ class hash_api {
               int *r = nullptr) {
 #ifdef NONVAR
     Pair_t<size_t, size_t> p(key, *reinterpret_cast<size_t *>(value));
+    p.set_flag(FLAG_t::VALID);
+    p.set_version(0);
 #elif VARVALUE
     Pair_t<size_t, std::string> p(key, value, value_len);
 #else

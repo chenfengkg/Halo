@@ -56,8 +56,8 @@ class Pair_t {
     _key = 0;
     _value = 0;
   }
-  void set_version(uint64_t old_version) { version = old_version + 1; }
-  void set_op(OP_t o) { op = static_cast<uint16_t>(o); }
+  void set_version(OP_VERSION old_version) { version = old_version + 1; }
+  void set_op(OP_t o) { op = static_cast<OP_VERSION>(o); }
   OP_t get_op() { return static_cast<OP_t>(op); }
   void set_op_persist(OP_t o) {
     op = static_cast<uint16_t>(o);
@@ -133,8 +133,8 @@ class Pair_t<KEY, std::string> {
     memcpy(addr + len, &svalue[0], _vlen);
   }
   void set_empty() { _vlen = 0; }
-  void set_version(uint64_t old_version) { version = old_version + 1; }
-  void set_op(OP_t o) { op = static_cast<uint16_t>(o); }
+  void set_version(OP_VERSION old_version) { version = old_version + 1; }
+  void set_op(OP_t o) { op = static_cast<OP_VERSION>(o); }
   OP_t get_op() { return op; }
   void set_op_persist(OP_t o) {
     op = static_cast<uint16_t>(o);
@@ -228,8 +228,8 @@ class Pair_t<std::string, std::string> {
     _klen = 0;
     _vlen = 0;
   }
-  void set_version(uint64_t old_version) { version = old_version + 1; }
-  void set_op(OP_t o) { op = static_cast<uint16_t>(o); }
+  void set_version(OP_VERSION old_version) { version = old_version + 1; }
+  void set_op(OP_t o) { op = static_cast<OP_VERSION>(o); }
   OP_t get_op() { return static_cast<OP_t>(op); }
   void set_op_persist(OP_t o) {
     op = static_cast<uint16_t>(o);
