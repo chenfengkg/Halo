@@ -16,7 +16,7 @@ class hash_api {
 #else
   HLSH<std::string, std::string> *t;
 #endif
-  hash_api(size_t sz = 1024 * 16) {
+  hash_api(size_t sz = 1024) {
     std::string hlsh = index_pool_name + "HLSH.data";
     size_t hlsh_pool_size = 16ul * 1024ul * 1024Ul * 1024ul;
     if(FileExists(hlsh.c_str())) FileRemove(hlsh.c_str());

@@ -79,7 +79,7 @@ namespace HLSH_hashing {
         size_t Recovery() {
             std::vector<std::thread> td;
             // s1: travese each chunk list and assign one dedicated thread for each chunk list
-            for (size_t i = 0; i < kThreadNum; i++)
+            for (size_t i = 0; i < kLogNum; i++)
             {
                 // s1.1: get chunk list head
                 auto chunk_list = reinterpret_cast<PmChunkList<KEY,VALUE>*>(pool_addr + i * kChunkSize);

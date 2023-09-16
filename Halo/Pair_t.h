@@ -135,7 +135,7 @@ class Pair_t<KEY, std::string> {
   void set_empty() { _vlen = 0; }
   void set_version(OP_VERSION old_version) { version = old_version + 1; }
   void set_op(OP_t o) { op = static_cast<OP_VERSION>(o); }
-  OP_t get_op() { return op; }
+  OP_t get_op() { return static_cast<OP_t>(op); }
   void set_op_persist(OP_t o) {
     op = static_cast<uint16_t>(o);
     pmem_persist(reinterpret_cast<char *>(this), 8);

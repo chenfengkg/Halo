@@ -66,11 +66,10 @@ class HLSH {
     // s1: get segment pointer from lastest dir
     auto d = __atomic_load_n(&dir, __ATOMIC_ACQUIRE);
     auto x = (key_hash >> (8 * sizeof(key_hash) - d->global_depth));
-    auto dir_entry = d->_;
-    Segment<KEY,VALUE>* seg = dir_entry[x];
     // s2: get segment pointer from old dir if pointer is null
-    if (!seg) {
-      seg = d->old_dir->_[x / 2];
+    auto seg = d->_[x];
+    if (d->_[x] == nullptr) {
+        seg = d->old_dir->_[x / 2];
     }
     return seg;
   }
@@ -95,8 +94,7 @@ class HLSH {
         return seg;
       }
       // s2.2.2: get start position and chunk size in new dir
-      size_t start_pos = seg->pattern
-                         << (d->global_depth - seg->local_depth);
+      size_t start_pos = seg->pattern << (d->global_depth - seg->local_depth);
       size_t chunk_size = pow(2, d->global_depth - seg->local_depth);
       // s2.2.3: update dir entries point to this valid segment
       for (int i = chunk_size - 1; i >= 0; i--) {
@@ -121,7 +119,7 @@ class HLSH {
         for (int i = initCap - 1; i >= 0; --i) {
             Segment<KEY,VALUE>::New(&ptr, dir->global_depth, i, next, salloc, 0);
             // s2.1: init seg as split segment 
-            ptr->InitSeg();
+            ptr->SetSplitSeg();
             dir->_[i] = ptr;
             next = ptr;
         }
@@ -151,8 +149,8 @@ class HLSH {
         Segment<KEY,VALUE>* ptr = nullptr, * next = nullptr;
         for (int i = initCap - 1; i >= 0; --i) {
             Segment<KEY,VALUE>::New(&ptr, dir->global_depth, next, i);
-            // s2.1: init seg as split segment 
-            ptr->InitSeg();
+            // s2.1: init seg as split segment
+            ptr->SetSplitSeg();
             dir->_[i] = ptr;
             next = ptr;
         }
@@ -166,11 +164,12 @@ class HLSH {
         printf("recovery time(LEH): %f s\n", elapsed_sec);
     }
 
-    template <class KEY,class VALUE>
-    HLSH<KEY,VALUE>::~HLSH(void) {
-        size_t total_usage = salloc->MemoryUsage() + dalloc->MemoryUsage() + sizeof(PmManage<KEY,VALUE>) + sizeof(HLSH<KEY,VALUE>);
+    template <class KEY, class VALUE>
+    HLSH<KEY, VALUE>::~HLSH(void) {
+        size_t total_usage = salloc->MemoryUsage() + dalloc->MemoryUsage() + sizeof(PmManage<KEY, VALUE>) + sizeof(HLSH<KEY, VALUE>);
         float tu = total_usage;
         printf("HLSH DRAM total_Usage: %fB, %fKB, %fMB, %fGB\n", tu, tu / (1024.0), tu / (1024.0 * 1024.0), tu / (1024.0 * 1024.0 * 1024.0));
+        printf("count: %lu\n", count.load());
     }
 
     template <class KEY, class VALUE>
@@ -197,7 +196,6 @@ class HLSH {
         auto capacity = pow(2, global_depth + 1);
         Directory<KEY,VALUE>::New(&back_dir, capacity, dir->version + 1, dir, dalloc);
         __atomic_store_n(&dir, back_dir, __ATOMIC_RELEASE);
-        back_dir = nullptr;
         // s4: make background thread update entries for new directory
         // dalloc->InsertNewDir(dir);
         auto od = dir->old_dir;
@@ -307,56 +305,63 @@ class HLSH {
 
     /* get key value with option epoch */
     template <class KEY, class VALUE>
-    bool HLSH<KEY, VALUE>::Get(Pair_t<KEY, VALUE>* p) {
-        GetNum++;
-        if (!(GetNum % PrefetchNum))
-        {
-            for (size_t i = 0; i < PrefetchNum; i++)
-            {
-                if (pv[i].ok != nullptr)
-                {
-                    // auto prep = reinterpret_cast<Pair_t<KEY, VALUE> *>(pv[i].ok);
-                    // for (auto kp : pv[i].kp)
-                    // {
-                    //     auto t = reinterpret_cast<Pair_t<KEY, VALUE> *>(kp);
-                    //     if (prep->str_key() == t->str_key())
-                    //     {
-                    //         prep->load(kp);
-                    //         auto tmp = __atomic_load_n(&t->fv.pad, __ATOMIC_ACQUIRE);
-                    //         FlagVersion fv(tmp);
-                    //         if (fv.get_flag() == FLAG_t::VALID)
-                    //         {
-                    //             break;
-                    //         }
-                    //     }
-                    // }
-                    pv[i].Clear();
-                }
-            }
-            GetNum = 0;
-        }
+    bool HLSH<KEY, VALUE>::Get(Pair_t<KEY, VALUE> *p)
+    {
+        // GetNum++;
+        // if (!(GetNum % PrefetchNum))
+        // {
+        //     for (size_t i = 0; i < PrefetchNum; i++)
+        //     {
+        //         if (pv[i].ok != nullptr)
+        //         {
+        // auto prep = reinterpret_cast<Pair_t<KEY, VALUE> *>(pv[i].ok);
+        // for (auto kp : pv[i].kp)
+        // {
+        //     auto t = reinterpret_cast<Pair_t<KEY, VALUE> *>(kp);
+        //     if (prep->str_key() == t->str_key())
+        //     {
+        //         prep->load(kp);
+        //         auto tmp = __atomic_load_n(&t->fv.pad, __ATOMIC_ACQUIRE);
+        //         FlagVersion fv(tmp);
+        //         if (fv.get_flag() == FLAG_t::VALID)
+        //         {
+        //             break;
+        //         }
+        //     }
+        // }
+        //             pv[i].Clear();
+        //         }
+        //     }
+        //     GetNum = 0;
+        // }
         // s1: caculate hash value for key-value pair
-        uint64_t key_hash = h(p->key(),p->klen());
+        uint64_t key_hash = h(p->key(), p->klen());
         // s2: obtain segment
         auto seg = GetSegment(key_hash);
     RETRY:
         // s3: get value from segment
         int extra_rcode = 0;
         auto r = seg->Get(p, key_hash, extra_rcode);
-        // s4: return value or retry  
-        // if (rFailure == r) {
+        // s4: return value or retry
+        if (rFailure == r)
+        {
             // s2.4.1: may split to other segment
-            if (rSegmentChanged == extra_rcode) {
+            if (rSegmentChanged == extra_rcode)
+            {
                 auto new_seg = GetSegment(key_hash);
-                if (new_seg != seg) { seg = new_seg; goto RETRY; }
+                if (new_seg != seg)
+                {
+                    seg = new_seg;
+                    goto RETRY;
+                }
             }
-            else if (rPreSegment == extra_rcode) {
+            else if (rPreSegment == extra_rcode)
+            {
                 seg = seg->pre;
                 goto RETRY;
             }
-        // }
-        // return r;
-        return true;
+        }
+        return r;
     }
 
     /* Delete: By default, the merge operation is disabled*/

@@ -82,11 +82,13 @@ namespace HLSH_hashing
       auto pt = reinterpret_cast<Pair_t<KEY, VALUE> *>(p);
       *this = *pt;
     }
+
     void load(char *p)
     {
       auto pt = reinterpret_cast<Pair_t<KEY, VALUE> *>(p);
       *this = *pt;
     }
+
     KEY *key() { return &_key; }
     KEY str_key() { return _key; }
     VALUE value() { return _value; }
@@ -108,15 +110,6 @@ namespace HLSH_hashing
       clwb_sfence(addr, size());
     }
 
-    void store_persist_update(char *addr) { store_persist(addr); }
-
-    void store(void *addr)
-    {
-      auto p = reinterpret_cast<void *>(this);
-      auto len = size();
-      memcpy(addr, p, len);
-    }
-
     void set_empty()
     {
       _key = 0;
@@ -131,7 +124,7 @@ namespace HLSH_hashing
     void set_flag_persist(FLAG_t f)
     {
       fv.set_flag(f);
-      pmem_persist(reinterpret_cast<char *>(this), 8);
+      clwb_sfence(reinterpret_cast<char *>(this), 8);
     }
 
     size_t size()
@@ -149,11 +142,13 @@ namespace HLSH_hashing
     KEY _key;
     uint32_t _vlen;
     std::string svalue;
+
     Pair_t()
     {
       _vlen = 0;
       svalue.reserve(MAX_VALUE_LEN);
     };
+
     Pair_t(char *p)
     {
       auto pt = reinterpret_cast<Pair_t *>(p);
@@ -166,8 +161,8 @@ namespace HLSH_hashing
     void load(char *p)
     {
       auto pt = reinterpret_cast<Pair_t *>(p);
-      _key = pt->_key;
       fv = pt->fv;
+      _key = pt->_key;
       _vlen = pt->_vlen;
       svalue.assign(p + sizeof(KEY) + sizeof(uint32_t) + sizeof(FLAG_VERSION), _vlen);
     }
@@ -191,28 +186,10 @@ namespace HLSH_hashing
       auto p = reinterpret_cast<char *>(this);
       auto len = sizeof(KEY) + sizeof(uint32_t);
       memcpy(addr + sizeof(FLAG_VERSION), p + sizeof(FLAG_VERSION), len);
-      memcpy(addr + len, &svalue[0], _vlen);
+      memcpy(addr + sizeof(FLAG_VERSION) + len, &svalue[0], _vlen);
       _mm_sfence();
       memcpy(addr, p, sizeof(FLAG_VERSION));
       clwb_sfence(addr, size());
-    }
-
-    void store_persist_update(char *addr)
-    {
-      auto p = reinterpret_cast<char *>(this);
-      auto len = sizeof(KEY) + sizeof(uint32_t) + sizeof(FLAG_VERSION);
-      memcpy(addr, p, len);
-      memcpy(addr + len, &svalue[0], _vlen);
-      reinterpret_cast<Pair_t<KEY, std::string> *>(addr)->set_version(fv.get_version() + 1);
-      pmem_persist(addr, len + _vlen);
-    }
-
-    void store(char *addr)
-    {
-      auto p = reinterpret_cast<char *>(this);
-      auto len = sizeof(KEY) + sizeof(uint32_t) + sizeof(FLAG_VERSION);
-      memcpy(addr, p, len);
-      memcpy(addr + len, &svalue[0], _vlen);
     }
 
     void set_empty() { _vlen = 0; }
@@ -223,7 +200,7 @@ namespace HLSH_hashing
     void set_flag_persist(FLAG_t f)
     {
       fv.set_flag(f);
-      pmem_persist(reinterpret_cast<char *>(this), 8);
+      clwb_sfence(reinterpret_cast<char *>(this), 8);
     }
     size_t size()
     {
@@ -297,25 +274,6 @@ namespace HLSH_hashing
       clwb_sfence(addr, size());
     }
 
-    void store_persist_update(char *addr)
-    {
-      auto p = reinterpret_cast<void *>(this);
-      auto len = sizeof(uint32_t) + sizeof(uint32_t) + sizeof(FLAG_VERSION);
-      memcpy(addr, p, len);
-      memcpy(addr + len, &skey[0], _klen);
-      memcpy(addr + len + _klen, &svalue[0], _vlen);
-      reinterpret_cast<Pair_t<std::string, std::string> *>(addr)->set_version(
-          fv.get_version() + 1);
-      pmem_persist(addr, len + _klen + _vlen);
-    }
-    void store(char *addr)
-    {
-      auto p = reinterpret_cast<void *>(this);
-      auto len = sizeof(uint32_t) + sizeof(uint32_t) + sizeof(FLAG_VERSION);
-      memcpy(addr, p, len);
-      memcpy(addr + len, &skey[0], _klen);
-      memcpy(addr + len + _klen, &svalue[0], _vlen);
-    }
     void set_empty()
     {
       _klen = 0;
@@ -328,7 +286,7 @@ namespace HLSH_hashing
     void set_flag_persist(FLAG_t f)
     {
       fv.set_flag(f);
-      pmem_persist(reinterpret_cast<char *>(this), 8);
+      clwb_sfence(reinterpret_cast<char *>(this), 8);
     }
 
     size_t size()

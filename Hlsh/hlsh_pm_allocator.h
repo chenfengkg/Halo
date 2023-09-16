@@ -22,7 +22,7 @@ namespace HLSH_hashing {
     constexpr size_t kReclaimThreshold = kChunkSize / 2;
     constexpr size_t kReclaimChunkNum = 32;
 
-    constexpr size_t kThreadNum = 32;
+    constexpr size_t kThreadNum = 36;
 
     static constexpr auto HLSH_MAP_PROT = PROT_WRITE | PROT_READ;
     static constexpr auto HLSH_MAP_FLAGS = MAP_SHARED_VALIDATE | MAP_SYNC;
@@ -54,7 +54,7 @@ namespace HLSH_hashing {
 
     PmOffset PO_NULL(0, 0); //NULL offset for PM
 
-    thread_local PmOffset tl_value;
+    thread_local PmOffset tl_value = PO_NULL;
 
     union FlagOffset {
       struct {

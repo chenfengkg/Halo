@@ -33,7 +33,8 @@ using namespace std;
 #define GET_CLHT_INDEX(kh, n) ((kh >> 56) % n)
 #define ROUND_UP(s, n) (((s) + (n)-1) & (~(n - 1)))
 constexpr size_t MAX_BATCHING_SIZE = 256;
-constexpr size_t READ_BUFFER_SIZE = 16 /* Pairs */;
+// constexpr size_t READ_BUFFER_SIZE = 16 /* Pairs */;
+constexpr size_t READ_BUFFER_SIZE = 1 /* Pairs */;
 
 using clht_val_t = volatile size_t;
 using clht_lock_t = volatile uint8_t;
@@ -1242,18 +1243,18 @@ class Halo {
         p->set_empty();
     }
     // load
-    // for (size_t i = 0; i < READ_BUFFER_SIZE; i++) {
-    //   if (!addrs[i]) {
-    //     continue;
-    //   }
-    //   auto r = reinterpret_cast<Pair_t<KEY, VALUE> *>(BUFFER_READ[i]);
-    //   auto p = reinterpret_cast<Pair_t<KEY, VALUE> *>(addrs[i]);
-    //   // cout << r->str_key() << "!" << p->str_key() << " " << p->value() <<
-    //   // endl;
-    //   if (r->str_key() != p->str_key()) cout << "ERROR!" << endl;
-    //   r->load(addrs[i]);
-    //   if (r->get_op() == OP_t::DELETED) r->set_empty();
-    // }
+    for (size_t i = 0; i < READ_BUFFER_SIZE; i++) {
+      if (!addrs[i]) {
+        continue;
+      }
+      auto r = reinterpret_cast<Pair_t<KEY, VALUE> *>(BUFFER_READ[i]);
+      auto p = reinterpret_cast<Pair_t<KEY, VALUE> *>(addrs[i]);
+      // cout << r->str_key() << "!" << p->str_key() << " " << p->value() <<
+      // endl;
+      if (r->str_key() != p->str_key()) cout << "ERROR!" << endl;
+      r->load(addrs[i]);
+      if (r->get_op() == OP_t::DELETED) r->set_empty();
+    }
     BUFFER_READ_COUNTER = 0;
   }
 

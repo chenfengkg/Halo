@@ -4,14 +4,11 @@
 
 namespace HLSH_hashing
 {
-  constexpr size_t kSegNum = 800;
-  constexpr size_t kUsedSegNum = 500;
-
-  constexpr size_t kHotBlockSize = 4 * 1024 * 1024;
-  constexpr size_t kUsedHotBlockNum = 4 * 512 * 1024;
+  constexpr size_t kSegNum = 80;
+  constexpr size_t kUsedSegNum = 10;
 
   template <class KEY, class VALUE>
-  struct alignas(64) BlockAllocator
+  struct BlockAllocator
   {
     Segment<KEY, VALUE> s[kSegNum];
     std::atomic<uint64_t> count;
@@ -29,7 +26,7 @@ namespace HLSH_hashing
       if (c >= kSegNum) return nullptr;
       return &s[c];
     }
-  };
+  } ALIGNED(64);
 
   template <class KEY, class VALUE>
   struct SegmentAllocator
@@ -55,11 +52,9 @@ namespace HLSH_hashing
       return total_usage;
     }
 
-    void PreAllocateSegment(size_t thread_id)
+    void PreAllocateSegment()
     {
       BlockAllocator<KEY, VALUE> *p = nullptr;
-      // s1: bind thread to core
-      set_affinity(thread_id);
       // s2: preallocate memory for each list if used number exceed the threshold
       while (1)
       {
@@ -87,24 +82,25 @@ namespace HLSH_hashing
         ba_end[i] = ba_head[i];
       }
       // s2: start preallocate thread
-      seg_thread = std::thread(&SegmentAllocator<KEY, VALUE>::PreAllocateSegment, this, 35);
+      seg_thread = std::thread(&SegmentAllocator<KEY, VALUE>::PreAllocateSegment, this);
 #endif
     }
 
     inline Segment<KEY, VALUE> *Get(size_t thread_id)
     {
       // s1: get new segment from pre allocated memory
-      auto nb = ba_end[thread_id]->GetTable();
+      auto tid = thread_id%kThreadNum;
+      auto nb = ba_end[tid]->GetTable();
       if (nb)
         return nb;
       // s2: wait until new block allocator is allocated and then allocate
       // new segment
-      auto n = ba_end[thread_id]->next.load(std::memory_order_acquire);
+      auto n = ba_end[tid]->next.load(std::memory_order_acquire);
       while (!n)
       {
-        n = ba_end[thread_id]->next.load(std::memory_order_acquire);
+        n = ba_end[tid]->next.load(std::memory_order_acquire);
       };
-      ba_end[thread_id] = n;
+      ba_end[tid] = n;
       return n->GetTable();
     }
   };

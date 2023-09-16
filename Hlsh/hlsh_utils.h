@@ -18,6 +18,7 @@
 
 namespace HLSH_hashing {
 #define ALIGNED(N) __attribute__((aligned(N)))
+#define PACKED __attribute__((packed))
 #define CHECK_BIT(var, pos) ((((var) & (1 << pos)) > 0) ? (1) : (0))
 #define CHECK_BITL(var, pos) ((((var) & (1UL << pos)) > 0) ? (1) : (0))
 
@@ -92,8 +93,7 @@ static bool FileRemove(const char* pool_path) {
 
 #define MMX_CMP8(src, key)                                               \
   do {                                                                   \
-    const __m64 key_data =                                               \
-        _mm_set1_pi8(key, key, key, key, key, key, key, key);            \
+    const __m64 key_data =  _mm_set1_pi8(key);            \
     __m64 seg_data = _mm_set_pi8(src[7], src[6], src[5], src[4], src[3], \
                                  src[2], src[1], src[0]);                \
     __m64 rv_mask = _mm_cmpeq_pi8(seg_data, key_data);                   \
@@ -102,12 +102,14 @@ static bool FileRemove(const char* pool_path) {
 
 // 128 bytes
 #define SSE_CMP8(src, key)                                                     \
-  do {                                                                         \
+  do{                                                                         \
     const __m128i key_data = _mm_set1_epi8(key);                               \
     __m128i seg_data = _mm_loadu_si128(reinterpret_cast<const __m128i*>(src)); \
     __m128i rv_mask = _mm_cmpeq_epi8(seg_data, key_data);                      \
     mask = _mm_movemask_epi8(rv_mask);                                         \
-  } while (0)
+  }while(0)
+
+    // mask = _mm_cmpeq_epi8_mask(seg_data,key_data);\
 
 // 256 bytes
 #define SIMD_CMP8(src, key)                                        \
