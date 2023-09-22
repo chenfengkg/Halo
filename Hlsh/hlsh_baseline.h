@@ -5,15 +5,11 @@ std::atomic<uint64_t> insert_time;
 
 template <class KEY, class VALUE>
 class HLSH {
+  Lock64 lock;  // the MSB is the lock bit; remaining bits are used as the counter
   Directory<KEY,VALUE>* dir;
   Directory<KEY,VALUE>* back_dir;
-  ReadShareLock
-      lock;  // the MSB is the lock bit; remaining bits are used as the counter
-  SegmentAllocator<KEY,VALUE>* salloc;
-  DirectoryAllocator<KEY,VALUE>* dalloc;
-  bool clean;
-  // size_t hot_counter[36];
   PmManage<KEY,VALUE>* pm;
+  bool clean;
 
  public:
   HLSH(const char*, const size_t&);
@@ -110,25 +106,19 @@ class HLSH {
     template <class KEY, class VALUE>
     HLSH<KEY, VALUE>::HLSH(size_t initCap, const char* pool_file,
                            const size_t& pool_size) {
-        // s1: preallocated segment and directory
-        salloc = new SegmentAllocator<KEY,VALUE>();
-        dalloc = new DirectoryAllocator<KEY,VALUE>(log2(initCap));
         // s2: init hash table on DRAM
-        Directory<KEY,VALUE>::New(&dir, initCap, 0, nullptr, dalloc);
+        Directory<KEY,VALUE>::New(&back_dir, initCap, 0, nullptr);
+        dir = back_dir;
         Segment<KEY,VALUE>* ptr = nullptr, * next = nullptr;
         for (int i = initCap - 1; i >= 0; --i) {
-            Segment<KEY,VALUE>::New(&ptr, dir->global_depth, i, next, salloc, 0);
+            Segment<KEY, VALUE>::New(&ptr, dir->global_depth, i);
             // s2.1: init seg as split segment 
-            ptr->SetSplitSeg();
             dir->_[i] = ptr;
-            next = ptr;
         }
-        ptr->pre = nullptr;
-        // s3: init other variable
-        back_dir = nullptr;
-        clean = false;
-        // s4: init PM management
+        // s: init PM management
         pm = new PmManage<KEY,VALUE>(pool_file, pool_size, this);
+        // s: crash or normal shutdown
+        clean = false;
 
         printf("size, segment: %lu, bucket: %lu\n", sizeof(Segment<KEY, VALUE>),
                sizeof(Bucket<KEY, VALUE>));
@@ -146,15 +136,13 @@ class HLSH {
         size_t depth = pm->GetDepth();
         Directory<KEY,VALUE>::New(&dir, pow(2, depth), 0);
         size_t initCap = pow(2, dir->global_depth);
-        Segment<KEY,VALUE>* ptr = nullptr, * next = nullptr;
+        Segment<KEY,VALUE>* ptr = nullptr;
         for (int i = initCap - 1; i >= 0; --i) {
-            Segment<KEY,VALUE>::New(&ptr, dir->global_depth, next, i);
+            Segment<KEY,VALUE>::New(&ptr, dir->global_depth, i);
             // s2.1: init seg as split segment
             ptr->SetSplitSeg();
             dir->_[i] = ptr;
-            next = ptr;
         }
-        ptr->pre = nullptr;
         // s3: insert key-value into index on DRAM
         Recovery();
 
@@ -166,7 +154,7 @@ class HLSH {
 
     template <class KEY, class VALUE>
     HLSH<KEY, VALUE>::~HLSH(void) {
-        size_t total_usage = salloc->MemoryUsage() + dalloc->MemoryUsage() + sizeof(PmManage<KEY, VALUE>) + sizeof(HLSH<KEY, VALUE>);
+        size_t total_usage =  sizeof(PmManage<KEY, VALUE>) + sizeof(HLSH<KEY, VALUE>);
         float tu = total_usage;
         printf("HLSH DRAM total_Usage: %fB, %fKB, %fMB, %fGB\n", tu, tu / (1024.0), tu / (1024.0 * 1024.0), tu / (1024.0 * 1024.0 * 1024.0));
         printf("count: %lu\n", count.load());
@@ -190,34 +178,34 @@ class HLSH {
         // s1: persist new depth into PM
         auto global_depth = dir->global_depth;
         pm->SetDepth(global_depth + 1);
-        // s2: wait until all entries in old dir updated 
-        // dalloc->WaitOldDir();
-        // s3: allocate new directory and replace dir
+        // s: wait until old persist thread finish
+        if (dir->ph) dir->ph->wait();
+        // s: create new file for persisting index
+        auto index_size = sizeof(PersistHash<KEY, VALUE>) + sizeof(uint64_t) * dir->capacity + sizeof(Segment<KEY, VALUE>) * dir->capacity;
+        index_size = Round2StripeSize(index_size);
+        uint64_t recovery_point[kThreadNum]; 
+        pm->GetRecoveryPoint(recovery_point);
+        auto persist_index = PersistHash<KEY, VALUE>::CreateNewPersist(dir, index_size, recovery_point);
+        // s: allocate new directory
         auto capacity = pow(2, global_depth + 1);
-        Directory<KEY,VALUE>::New(&back_dir, capacity, dir->version + 1, dir, dalloc);
-        __atomic_store_n(&dir, back_dir, __ATOMIC_RELEASE);
-        // s4: make background thread update entries for new directory
-        // dalloc->InsertNewDir(dir);
-        auto od = dir->old_dir;
-        auto nd = dir;
-        for (size_t i = 0;i < nd->capacity;) {
-            // s1.1.1: check whether the entry is updated
-            auto t = nd->_[i];
-            if (t) { i++; continue; }
-            // s1.1.2: get lock and update entries if the entry is not updated
-            t = od->_[i / 2];
-            t->lock.GetLock();
-            size_t chunk_size = pow(2, nd->global_depth - t->local_depth);
-            if (nd->_[i]) { t->lock.ReleaseLock(); i = i + chunk_size; continue; }
-            size_t start_pos = t->pattern << (nd->global_depth - t->local_depth);
-            for (size_t j = 0; j < chunk_size;j++) {
-                nd->_[start_pos + j] = t;
-            }
-            // s1.1.3: release lock and move to next entry
-            t->lock.ReleaseLock();
+        Directory<KEY,VALUE>::New(&back_dir, capacity, dir->version + 1, dir);
+        back_dir->ph = persist_index;
+        // s: traverse segments and set persist index
+        for (size_t i = 0; i < dir->capacity;)
+        {
+            auto s = dir->_[i];
+            s->lock.GetLock();
+            s->ph = persist_index;
+            size_t chunk_size = pow(2, dir->global_depth - s->local_depth);
+            s->lock.ReleaseLock();
             i = i + chunk_size;
         }
-
+        // s: set new dir to dir
+        __atomic_store_n(&dir, back_dir, __ATOMIC_RELEASE);
+        // s: start background thread to persist segment
+        std::thread t(&PersistHash<KEY, VALUE>::BackPersistSegment, persist_index, dir, dir->old_dir);
+        t.detach();
+        // s: print directory
         printf("DirectoryDouble towards->%u\n", global_depth + 1);
     }
 
@@ -245,8 +233,6 @@ class HLSH {
         if (rSegmentChanged == r) { goto RETRY; }
         // s3.4: segment need to split due to it is full
         if (rNoEmptySlot == r) {
-            // s3.4.1: split remaining buckets
-            seg->SplitRemainBuckets();
             auto old_local_depth = seg->local_depth;
             if (old_local_depth < copy_dir->global_depth) {
                 //s3.4.2: split segment without directory double
@@ -256,28 +242,35 @@ class HLSH {
                     seg->lock.ReleaseLock();
                 }
                 else {
-                    // s3.4.2.2: split segment
-                    dir = __atomic_load_n(&dir, __ATOMIC_ACQUIRE);
-                    if (dir != copy_dir) {
-                        // s3.4.2.2.1: dir double 
-                        copy_dir = dir;
+                    // s: persist segment to pm
+                    if (nullptr != seg->ph) {
+                        seg->ph->PersistSegment(seg);
                     }
-                    seg->GetLockForSplit(true);
-                    auto new_seg = seg->Split(salloc, thread_id);
+                    // s3.4.2.2: split segment
+                    auto d = __atomic_load_n(&dir, __ATOMIC_ACQUIRE);
+                    if (d != copy_dir) {
+                        // s3.4.2.2.1: dir double 
+                        copy_dir = d;
+                    }
+                    seg->GetBucketsLock();
+                    auto new_seg = seg->Split();
                     DirectoryUpdate(copy_dir, new_seg);
-                    new_seg->ReleaseLockForSplit();
-                    seg->ReleaseLockForSplit();
+                    new_seg->ReleaseBucketsLock();
+                    new_seg->lock.ReleaseLock();
+                    seg->ReleaseBucketsLock();
+                    seg->lock.ReleaseLock();
                 }
             }
             else {
                 // s3.4.3: double directory due to segment is only pointed by one entry
-                lock.Lock();
-                if (copy_dir->version != dir->version) {
+                lock.GetLock();
+                auto d = __atomic_load_n(&dir, __ATOMIC_ACQUIRE);
+                if (copy_dir->version != d->version) {
                     // s3.4.3.1: new directory has been allocated
-                    lock.Unlock();  goto RETRY;
+                    lock.ReleaseLock();  goto RETRY;
                 }  
                 DirectoryDouble();
-                lock.Unlock();
+                lock.ReleaseLock();
             }
 
             // s3.4.3 retry insert
@@ -343,23 +336,10 @@ class HLSH {
         int extra_rcode = 0;
         auto r = seg->Get(p, key_hash, extra_rcode);
         // s4: return value or retry
-        if (rFailure == r)
-        {
-            // s2.4.1: may split to other segment
-            if (rSegmentChanged == extra_rcode)
-            {
-                auto new_seg = GetSegment(key_hash);
-                if (new_seg != seg)
-                {
-                    seg = new_seg;
-                    goto RETRY;
-                }
-            }
-            else if (rPreSegment == extra_rcode)
-            {
-                seg = seg->pre;
+        if (rFailure == r) {
+            if (seg != GetSegment(key_hash)) {
                 goto RETRY;
-            }
+            };
         }
         return r;
     }

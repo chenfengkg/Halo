@@ -101,6 +101,14 @@ static bool FileRemove(const char* pool_path) {
   } while (0)
 
 // 128 bytes
+inline uint16_t CMP128(uint8_t src[], uint8_t key)
+{
+  const __m128i key_data = _mm_set1_epi8(key);
+  __m128i seg_data = _mm_loadu_si128(reinterpret_cast<const __m128i *>(src));
+  __m128i rv_mask = _mm_cmpeq_epi8(seg_data, key_data);
+  return _mm_movemask_epi8(rv_mask);
+}
+
 #define SSE_CMP8(src, key)                                                     \
   do{                                                                         \
     const __m128i key_data = _mm_set1_epi8(key);                               \

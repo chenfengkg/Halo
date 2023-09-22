@@ -1,9 +1,6 @@
 #include "hlsh_pm_allocator.h"
 
 namespace HLSH_hashing {
-    constexpr size_t kDelaySize = 256;
-    constexpr size_t kInvalidAddr = 1UL << 48;
-
 
     /*meta on DRAM: thread-local*/
     template <class KEY, class VALUE>
@@ -11,6 +8,8 @@ namespace HLSH_hashing {
         uint64_t start_addr;
         uint64_t offset;
         uint64_t dimm_no;  // belong to which dimm
+        uint64_t chunk_id;
+        uint64_t log_id; //belong to which log
 
         ThreadMeta() {}
 
@@ -19,12 +18,12 @@ namespace HLSH_hashing {
           auto len = p->size();
           if ((kChunkSize - offset) < len){
               clwb_sfence(reinterpret_cast<char *>(start_addr), sizeof(PmChunk<KEY, VALUE>));
-              return PmOffset(kInvalidAddr, 0);
+              return PO_NULL;
           }
           // s2: obtain the insertion address
           p->store_persist(reinterpret_cast<char*>(start_addr + offset));
           // s3: construct PM offset
-          PmOffset of(start_addr, offset);
+          PmOffset of(log_id, chunk_id, offset);
           // s4: increase offset (not flush)
           offset += len;
           return of;
@@ -36,7 +35,6 @@ namespace HLSH_hashing {
         uint64_t allocated_memory_block;
         std::atomic<uint64_t> concurrent_thread_num;
         std::mutex thread_limit_lock;
-        VersionLock new_chunk_lock;
 
         DimmMeta() {
             allocated_memory_block = 0;
@@ -60,6 +58,12 @@ namespace HLSH_hashing {
         DimmMeta dm[kDimmNum];
         uint64_t pool_addr;
         std::mutex mutex_lock;
+
+        inline void GetRecoveryPoint(uint64_t recovery_point[]){
+            for(size_t i = 0;i<kThreadNum;i++){
+                recovery_point[i] = tm[i].chunk_id;
+            }
+        }
 
         size_t GetDepth() {
             // s1: get pointer of the first chunk list head
@@ -94,7 +98,7 @@ namespace HLSH_hashing {
         }
 
         static uint64_t Create(const char* pool_file, const size_t& pool_size, HLSH<KEY,VALUE>* index) {
-            // s1: create file and map pmem to memory
+            // s: create file and map pmem to memory
             auto fd = open(pool_file, HLSH_FILE_OPEN_FLAGS, 0643);
             if (fd < 0) { printf("can't open file: %s\n", pool_file); }
             if ((errno = posix_fallocate(fd, 0, pool_size)) != 0) { perror("posix_fallocate"); exit(1); }
@@ -102,7 +106,7 @@ namespace HLSH_hashing {
             if ((pmem_addr) == nullptr || (pmem_addr) == MAP_FAILED) { printf("Can't mmap\n"); }
             close(fd);
 
-            // s3: using multiple thread to intialize each chunk list information
+            // s: using multiple thread to intialize each chunk list information
             std::vector<std::thread> vt;
             auto stripe_num = pool_size / kStripeSize;
             auto start_addr = reinterpret_cast<uint64_t>(pmem_addr);
@@ -115,6 +119,7 @@ namespace HLSH_hashing {
                 t.join();
             }
             printf("PM Create and initialization finished, addr: %lx\n", start_addr);
+            pmem_start_addr = start_addr;
             return start_addr;
         }
 
@@ -136,18 +141,25 @@ namespace HLSH_hashing {
             }
 
             printf("PM Open finished, addr: %lx", start_addr);
+            // s: set pmem addr as global variable
+            pmem_start_addr = start_addr;
             return start_addr;
         }
 
-        PmChunk<KEY, VALUE>* GetNewChunkFromDimm(size_t dimm_id) {
+        PmChunk<KEY, VALUE> *GetNewChunkFromDimm(size_t dimm_id, uint64_t &log_id)
+        {
             PmChunk<KEY,VALUE>* new_chunk = nullptr;
             // s1: obtain dimm address
             auto dimm_addr = pool_addr + dimm_id * kChunkNumPerDimm * kChunkSize;
+            log_id = dimm_id * kChunkNumPerDimm;
             // s2: get a new chunk by traversing all chunk list in the dimm 
             for (size_t i = 0;i < kChunkNumPerDimm;i++) {
                 auto list = reinterpret_cast<PmChunkList<KEY,VALUE>*>(dimm_addr + i * kChunkSize);
                 new_chunk = list->GetNewChunk();
-                if (new_chunk != nullptr) return new_chunk;
+                if (new_chunk != nullptr) {
+                    log_id += i;
+                    return new_chunk;
+                }
             }
             return new_chunk;
         }
@@ -168,9 +180,12 @@ namespace HLSH_hashing {
                 };
             }
             // s3: get memory from dimm and increase memory counter
-            auto chunk = GetNewChunkFromDimm(min_dimm);
+            uint64_t log_id = 0;
+            auto chunk = GetNewChunkFromDimm(min_dimm, log_id);
             dm[min_dimm].allocated_memory_block++;
             // s4: set new information for ThreadMeta 
+            tm[tid].log_id = log_id;
+            tm[tid].chunk_id = chunk->id;
             tm[tid].start_addr = reinterpret_cast<uint64_t>(chunk);
             tm[tid].offset = chunk->foffset.fo.offset;
             tm[tid].dimm_no = min_dimm;
@@ -194,7 +209,7 @@ namespace HLSH_hashing {
             // dm[dimm_no].EnterDimm();
             //s2: insert key-value pairs into pm
             auto pf = tm[tid].Insert(p);
-            if (kInvalidAddr == pf.chunk_start_addr) {
+            if (PO_NULL == pf) {
                 // s2.1: get new chunk due to old chunk is full
                 auto chunk = GetNewChunk(dimm_no, tid);
                 if (!chunk) {
@@ -210,16 +225,14 @@ namespace HLSH_hashing {
 
         inline PmOffset Update(Pair_t<KEY, VALUE>* p, size_t tid, PmOffset po) {
             // s1: insert new key-value with higher version into the pm
-            auto op = reinterpret_cast<Pair_t<KEY, VALUE>*>(
-                po.chunk_start_addr + po.offset);
+            auto op = reinterpret_cast<Pair_t<KEY, VALUE> *>(po.GetValue());
             p->set_version(op->get_version() + 1);
             auto pf = Insert(p, tid);
             // s2: remove old key-value
             op->set_flag(FLAG_t::INVALID);
             clwb_sfence(reinterpret_cast<char*>(op), sizeof(FLAG_VERSION));
             // s3: free space for old key-value
-            auto chunk =
-                reinterpret_cast<PmChunk<KEY, VALUE>*>(po.chunk_start_addr);
+            auto chunk = reinterpret_cast<PmChunk<KEY, VALUE> *>(po.GetChunk());
             uint64_t len = op->size();
             chunk->free_size += len;
             clwb_sfence(&chunk->free_size, sizeof(uint64_t));
@@ -230,13 +243,11 @@ namespace HLSH_hashing {
         /*Delete kv pair*/
         inline void Delete(PmOffset po) {
             // s1: invalid and persist flag
-            auto p = reinterpret_cast<Pair_t<KEY, VALUE>*>(po.chunk_start_addr +
-                                                           po.offset);
+            auto p = reinterpret_cast<Pair_t<KEY, VALUE>*>(po.GetValue());
             p->set_flag(FLAG_t::INVALID);
             clwb_sfence(reinterpret_cast<char*>(p), sizeof(FLAG_VERSION));
             // s2: increase and persist free size
-            auto chunk =
-                reinterpret_cast<PmChunk<KEY, VALUE>*>(po.chunk_start_addr);
+            auto chunk = reinterpret_cast<PmChunk<KEY, VALUE> *>(po.GetChunk());
             uint64_t len = p->size();
             chunk->free_size += len;
             clwb_sfence(&chunk->free_size, sizeof(uint64_t));

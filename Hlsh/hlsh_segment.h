@@ -14,31 +14,34 @@ namespace HLSH_hashing
     SplitSegmentSplit,   // 3
   };
 
+  template<class KEY,class VALUE>
+  struct PersistHash;
+
   /* the segment class*/
   template <class KEY, class VALUE>
   struct Segment
   {
-    LightLock lock;        // 1B: lock for directory entries
-    uint8_t pad[3];
+    Lock64 lock;        // 8B: lock for directory entries
+    PersistHash<KEY,VALUE>* ph; //8B
     uint64_t pattern : 58; // 8B
     uint64_t local_depth : 6;
-    Segment<KEY, VALUE> *pre;  // 8B
-    Segment<KEY, VALUE> *next; // 8B
-    Stash<KEY, VALUE> stash;
+    SpareBucket<KEY, VALUE> sbucket;
     Bucket<KEY, VALUE> bucket[kNumBucket];
 
-    static size_t GetSlotNum()
-    {
+
+    static size_t GetSlotNum() {
       return kNumBucket * Bucket<KEY, VALUE>::GetSize() +
-             Stash<KEY, VALUE>::GetSize();
+             SpareBucket<KEY, VALUE>::GetSize();
     }
 
     inline void Init()
     {
       // s: init lock
       lock.Init();
-      // s: init stash
-      stash.Init();
+      // s: init persist hash
+      ph = nullptr;
+      // s: init share buckets
+      sbucket.Init();
       // s: init bucket
       for (size_t i = 0; i < kNumBucket; i++)
       {
@@ -47,8 +50,7 @@ namespace HLSH_hashing
       }
     }
 
-    static void New(Segment<KEY, VALUE> **tbl, size_t depth,
-                    Segment<KEY, VALUE> *p_next, size_t pattern)
+    static void New(Segment<KEY, VALUE> **tbl, size_t depth, size_t pattern)
     {
       // s1: allocate new segment by memory allocator
       // *tbl = new Segment();
@@ -58,9 +60,6 @@ namespace HLSH_hashing
         auto t = *tbl;
         // s: initialization
         t->Init();
-        // s: link to segment list
-        t->next = p_next;
-        if (p_next) p_next->pre = t;
         // s: update local depth and pattern
         t->local_depth = depth;
         t->pattern = pattern;
@@ -71,37 +70,9 @@ namespace HLSH_hashing
         fflush(stdout);
       }
     }
+    
 
-    static void New(Segment<KEY, VALUE> **tbl, size_t depth, size_t pattern,
-                    Segment<KEY, VALUE> *p_next,
-                    SegmentAllocator<KEY, VALUE> *salloc, size_t thread_id)
-    {
-#ifdef ENABLE_PREALLOC
-      // s1: allocate new segment form preallocated memory block
-      (*tbl) = salloc->Get(thread_id);
-      // s2: link to segment list
-      auto t = *tbl;
-      t->next = p_next;
-      if (p_next)
-        p_next->pre = t;
-      // s3: update local depth
-      t->local_depth = depth;
-      t->pattern = pattern;
-#else
-      New(tbl, depth, p_next, pattern);
-#endif
-    }
-
-    Segment()
-    {
-      // s: set stash value for each bucket
-      auto s = reinterpret_cast<uint64_t>(&stash);
-      for (size_t i = 0; i < kNumBucket; i++)
-      {
-        auto b = bucket + i;
-        b->stash_offset = (uint16_t)(reinterpret_cast<uint64_t>(b) - s);
-      }
-    }
+    Segment() { }
 
     ~Segment(void) {}
 
@@ -116,21 +87,11 @@ namespace HLSH_hashing
                       PmManage<KEY, VALUE> *pm, size_t thread_id,
                       HLSH<KEY, VALUE> *index);
     inline int HelpSplit();
-    inline int SplitBucket(Bucket<KEY, VALUE> *, size_t);
-    inline void SplitRemainBuckets();
-    inline void GetLockForSplit(bool is_split);
-    inline void ReleaseLockForSplit();
-    Segment<KEY, VALUE> *Split(SegmentAllocator<KEY, VALUE> *, size_t);
+    inline int SplitBucket(Bucket<KEY, VALUE> *, Segment<KEY, VALUE> *, size_t);
+    inline void GetBucketsLock();
+    inline void ReleaseBucketsLock();
+    Segment<KEY, VALUE> *Split();
 
-    /*InitalSeg: split seg*/
-    inline void SetSplitSeg()
-    {
-      for (size_t i = 0; i < kNumBucket; i++)
-      {
-        auto b = bucket + i;
-        b->lock.SetSplitBucket();
-      }
-    }
 
     void SegLoadFactor()
     {
@@ -142,36 +103,32 @@ namespace HLSH_hashing
         count += curr_bucket->GetCount();
       }
       // s2: calculate load factor
-      auto lf = count / (kBucketNormalSlotNum * kNumBucket + kStashPairNum);
+      auto lf = count / (kBucketNormalSlotNum * kNumBucket + kSparePairNum);
       printf("this: %p, pattern: %lu, local_depth: %lu, lf: %f\n", this,
              pattern, local_depth, lf);
     }
   } PACKED;
 
   template <class KEY, class VALUE>
-  void Segment<KEY, VALUE>::GetLockForSplit(bool is_split)
+  void Segment<KEY, VALUE>::GetBucketsLock()
   {
-    // s2: get all buckets lock
+    // s: get all buckets lock
     for (size_t i = 0; i < kNumBucket; i++)
     {
       auto b = bucket + i;
-      b->lock.GetLockForSplit(is_split);
+      b->lock.GetLock();
     }
   }
 
   template <class KEY, class VALUE>
-  void Segment<KEY, VALUE>::ReleaseLockForSplit()
+  void Segment<KEY, VALUE>::ReleaseBucketsLock()
   {
     // s1: Release all buckets lock
     for (size_t i = 0; i < kNumBucket; i++)
     {
       auto b = bucket + i;
-      // s1.1: release lock with buckets are not split
-      // b->lock.ReleaseLock();
-      b->lock.ReleaseLockForSplit();
+      b->lock.ReleaseLock();
     }
-    // s2: Release segment lock
-    lock.ReleaseLock();
   }
 
   template <class KEY, class VALUE>
@@ -199,31 +156,22 @@ namespace HLSH_hashing
                                   HLSH<KEY, VALUE> *index,
                                   PmManage<KEY, VALUE> *pm, size_t thread_id)
   {
-    // s0: get finger for key and bucket index
+    // s: get finger for key and bucket index
     auto finger = KEY_FINGER(key_hash); // the last 8 bits
     auto y = BUCKET_INDEX(key_hash);
   RETRY:
-    // s1: obtain lock for target bucket
+    // s: obtain lock for target bucket
     Bucket<KEY, VALUE> *t = bucket + y;
     t->lock.GetLock();
-    // s1: help to split bucket
-    // auto sr = SplitBucket(t, y);
-    // if (rFailureGetLock == sr) { t->lock.ReleaseLock(); goto RETRY; }
-    bool is_split = false;
-    // if (rSplitSuccess == sr) { is_split = true; }
-    // s2: if segment is changed, need to reinsert
     if (this != index->GetSegment(key_hash))
     {
       t->lock.ReleaseLock();
       return rSegmentChanged;
     }
-    // s3: insert to target bucket
-    auto r = t->Insert(p, key_hash, finger, pm, thread_id, &stash);
-    // s4: release bucket lock
-    if (is_split)
-      t->lock.ReleaseLockForSplit();
-    else
-      t->lock.ReleaseLock();
+    // s: insert to target bucket
+    auto r = t->Insert(p, key_hash, finger, pm, thread_id, &sbucket);
+    // s: release lock
+    t->lock.ReleaseLock();
 
     return r;
   }
@@ -240,20 +188,8 @@ namespace HLSH_hashing
     auto t = bucket + y;
   RETRY:
     t->lock.GetLock();
-    // s2: help slit bucket
-    auto sr = SplitBucket(t, y);
-    if (rFailureGetLock == sr)
-    {
-      t->lock.ReleaseLock();
-      goto RETRY;
-    }
-    bool is_split = false;
-    if (rSplitSuccess == sr)
-    {
-      is_split = true;
-    }
-    // s3: delete
-    auto r = t->Delete(p, key_hash, finger, pm, &stash);
+    // s: delete
+    auto r = t->Delete(p, key_hash, finger, pm, &sbucket);
     if (rFailure == r)
     {
       if (this != index->GetSegment(key_hash))
@@ -262,11 +198,8 @@ namespace HLSH_hashing
         return rSegmentChanged;
       }
     }
-    // s4: release bucket lock
-    if (is_split)
-      t->lock.ReleaseLockForSplit();
-    else
-      t->lock.ReleaseLock();
+    // s: release bucket lock
+    t->lock.ReleaseLock();
 
     return r;
   }
@@ -284,20 +217,8 @@ namespace HLSH_hashing
     auto t = bucket + y;
   RETRY:
     t->lock.GetLock();
-    // s3: help split
-    auto sr = SplitBucket(t, y);
-    if (rFailureGetLock == sr)
-    {
-      t->lock.ReleaseLock();
-      goto RETRY;
-    }
-    bool is_split = false;
-    if (rSplitSuccess == sr)
-    {
-      is_split = true;
-    }
     // s4: update
-    auto r = t->Update(p, key_hash, finger, pm, thread_id, &stash);
+    auto r = t->Update(p, key_hash, finger, pm, thread_id, &sbucket);
     if (rFailure == r)
     {
       if (this != index->GetSegment(key_hash))
@@ -306,11 +227,7 @@ namespace HLSH_hashing
         return rSegmentChanged;
       }
     }
-    // s4: release bucket lock
-    if (is_split)
-      t->lock.ReleaseLockForSplit();
-    else
-      t->lock.ReleaseLock();
+    t->lock.ReleaseLock();
 
     return r;
   }
@@ -329,7 +246,7 @@ namespace HLSH_hashing
     // s2: get version
     auto old_version = target->lock.GetVersionWithoutLock();
     // s3: get and return value from target bucket if value exist
-    auto r = target->Get(p, key_hash, finger, &stash);
+    auto r = target->Get(p, key_hash, finger, &sbucket);
     // s4: retry or return based on return value
     if (rSuccess != r)
     {
@@ -339,94 +256,19 @@ namespace HLSH_hashing
         goto RETRY;
       }
     }
-    else
-    {
-      // s4.2: two case need to retry: 1: segment is changed 2. bucket is not
-      // split
-      auto old_value = __atomic_load_n(&target->lock.vlock.info, __ATOMIC_ACQUIRE);
-      BucketVersionLock l(old_value);
-      if (l.vlock.is_split)
-      {
-        // s4.2.1: need to check whether other segment exist valid only if bucket
-        // split
-        extra_rcode = rSegmentChanged;
-      }
-      else if (!l.vlock.is_split_seg)
-      {
-        // s4.2.1: value may exist previous segment
-        extra_rcode = rPreSegment;
-      }
-    }
     return r;
   }
 
-  template <class KEY, class VALUE>
-  void Segment<KEY, VALUE>::SplitRemainBuckets()
-  {
-    // s: traverse and split bucket
-    for (size_t i = 0; i < kNumBucket; i++)
-    {
-      auto b = bucket + i;
-    RETRY:
-      b->lock.GetLock();
-      auto r = SplitBucket(b, i);
-      if (rFailureGetLock == r)
-      {
-        b->lock.ReleaseLock();
-        goto RETRY;
-      }
-      b->lock.ReleaseLockForSplit();
-    }
-  }
 
   /* Split target buckets*/
   template <class KEY, class VALUE>
-  int Segment<KEY, VALUE>::SplitBucket(Bucket<KEY, VALUE> *target,
-                                       size_t bucket_index)
+  int Segment<KEY, VALUE>::SplitBucket(Bucket<KEY, VALUE> *split_bucket,
+                                       Segment<KEY, VALUE> *new_seg, size_t bucket_index)
   {
-    // s1: check whether bucket is split
-    // s1.1: get vlock
-    uint16_t old_value =
-        __atomic_load_n(&target->lock.vlock.info, __ATOMIC_ACQUIRE);
-    // s1.2: check wheteher lock is set
-    BucketVersionLock l(old_value);
-    if (l.vlock.is_split)
-      return rSuccess;
+    Segment<KEY, VALUE> *split_seg = this;
+    auto new_bucket = new_seg->bucket + bucket_index;
 
-    // s2: get split target and new seg pointer
-    Segment<KEY, VALUE> *split_seg, *new_seg, *lock_seg;
-    if (l.vlock.is_split_seg)
-    {
-      split_seg = this;
-      new_seg = next;
-      lock_seg = next;
-    }
-    else
-    {
-      split_seg = pre;
-      new_seg = this;
-      lock_seg = pre;
-    }
-
-    // s3: get lock for bucket in other segment
-    auto lock_bucket = lock_seg->bucket + bucket_index;
-    // if (!lock_bucket->lock.TryGetLock()) return rFailureGetLock;
-    /* s4: traverse bucket and move valid records to new segment*/
-    // s4.1: determin split bucket and new bucket
-    Bucket<KEY, VALUE> *split_bucket, *new_bucket;
-    Stash<KEY, VALUE> *split_stash = &split_seg->stash, *new_stash = &new_seg->stash;
-    if (l.vlock.is_split_seg)
-    {
-      split_bucket = target;
-      new_bucket = lock_bucket;
-    }
-    else
-    {
-      split_bucket = lock_bucket;
-      new_bucket = target;
-    }
-    // split_bucket->BkLoadFactor(true);
-    // s4.1: move value in slot
+    // s: move value in slot
     uint32_t invalid_mask = 0;
     for (int j = 0; j < kBucketNormalSlotNum; ++j)
     {
@@ -436,60 +278,53 @@ namespace HLSH_hashing
         if ((key_hash >> (64 - new_seg->local_depth)) == new_seg->pattern)
         {
           invalid_mask = invalid_mask | ((uint32_t)1 << j);
-          new_bucket->Insert(split_bucket->slot[j], split_bucket->fingers[j],&new_seg->stash);
+          new_bucket->Insert(split_bucket->slot[j], split_bucket->fingers[j],&new_seg->sbucket);
         }
       }
     }
-    // s4.1 move value in stash
+    // s4.1 move value in spare bucket
+    auto split_sbucket = &sbucket;
     for (size_t j = kBucketNormalSlotNum; j < kBucketTotalSlotNum; j++)
     {
       if (CHECK_BIT(split_bucket->bitmap, j))
       {
-        auto pos = split_bucket->stash_pos[j - kBucketNormalSlotNum];
-        auto key_hash = split_stash->_[pos].key;
+        auto pos = split_bucket->s_pos[j - kBucketNormalSlotNum];
+        auto key_hash = split_sbucket->_[pos].key;
         if ((key_hash >> (64 - new_seg->local_depth)) == new_seg->pattern)
         {
           invalid_mask = invalid_mask | ((uint32_t)1 << j);
-          new_bucket->Insert(split_stash->_[pos], split_bucket->fingers[j], &new_seg->stash);
-          split_stash->ClearBit(pos);
+          new_bucket->Insert(split_sbucket->_[pos], split_bucket->fingers[j], &new_seg->sbucket);
+          split_sbucket->ClearBit(pos);
         }
       }
     }
 
-    // s5: clear bucket and stash metadata
+    // s5: clear bucket metadata
     split_bucket->bitmap = split_bucket->bitmap & (~invalid_mask);
 
-    // split_bucket->BkLoadFactor(false);
-    // new_bucket->BkLoadFactor(false);
-    // s6: release bucket lock in other segment
-    // lock_bucket->lock.ReleaseLockForSplit();
     return rSuccess;
   }
 
-  /* split stash */
   template <class KEY, class VALUE>
-  Segment<KEY, VALUE> *Segment<KEY, VALUE>::Split(
-      SegmentAllocator<KEY, VALUE> *salloc, size_t thread_id)
+  Segment<KEY, VALUE> *Segment<KEY, VALUE>::Split()
   {
     // s1: update medata in split segment
     local_depth = local_depth + 1;
     pattern = pattern << 1;
     // s2: allocate new segment and update metadata in new segment
     size_t new_pattern = pattern + 1;
-    Segment<KEY, VALUE>::New(&next, local_depth, new_pattern, next, salloc,
-                             thread_id);
-    // s3: and add into segment lists
-    next->pre = this;
+    Segment<KEY,VALUE>* new_seg;
+    Segment<KEY, VALUE>::New(&new_seg, local_depth, new_pattern);
     // s4: get lock for split
-    next->lock.GetLock();
-    next->GetLockForSplit(false);
+    new_seg->lock.GetLock();
+    new_seg->GetBucketsLock();
 
     // s5: split all bucket
     for (size_t i = 0; i < kNumBucket; i++)
     {
       auto b = bucket + i;
-      SplitBucket(b, i);
+      SplitBucket(b, new_seg, i);
     }
-    return next;
+    return new_seg;
   }
 } // namespace HLSH_hashing

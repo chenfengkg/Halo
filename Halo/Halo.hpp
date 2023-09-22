@@ -538,6 +538,39 @@ struct CLHT {
     } while (Unlikely(bucket != NULL));
     return {INVALID, 0};
   }
+  
+  template<class KEY,class VALUE>
+  bool clht_get(size_t key, Pair_t<KEY, VALUE> *p)
+  {
+    size_t bin = clht_hash(table, key);
+    if (resize_lock) ;
+    volatile Bucket *bucket = table->buckets + bin;
+    // auto bbb = bucket;
+    uint32_t j;
+    do
+    {
+      for (j = 0; j < ENTRIES_PER_BUCKET; j++)
+      {
+        clht_val_t val = bucket->val[j];
+        if (bucket->key[j] == key)
+        {
+          return true;
+          if (Likely(bucket->val[j] == val))
+          {
+            auto page_index = val / PAGE_SIZE;
+            auto v = reinterpret_cast<Pair_t<KEY, VALUE> *>(PPage_table[page_index].load() +
+                                                            val % PAGE_SIZE);
+            if (v->str_key() == p->str_key())
+            {
+              return true;
+            }
+          }
+        }
+      }
+      bucket = (Bucket *)get_DPage_addr(bucket->next);
+    } while (Unlikely(bucket != NULL));
+    return false;
+  }
   /* Insert a key-value pair into a hashtable with replacement. */
   template <typename KEY, typename VALUE>
   pair<int, size_t> clht_put_replace(size_t key, Pair_t<KEY, VALUE> *p) {
@@ -1044,24 +1077,24 @@ class Halo {
       memory_manager_Pool.get_PM_MemoryManager(&mmanager);
     auto hkey = hash_func(reinterpret_cast<void *>(p.key()), p.klen());
     auto addr = get_PM_addr(hkey);
-    // if (addr == nullptr) {
-    //   auto len = p.size();
-    //   auto &pm = mmanager;
-    //   auto offset_and_addr = pm.halloc(len);
-    //   // auto offset = offset_and_addr.first;
-    //   auto addr = offset_and_addr.second;
-    //   auto add = reinterpret_cast<long long *>(&p);
-    //   auto paddr = reinterpret_cast<long long *>(addr);
-    //   pmem_memcpy_persist(paddr, add, len);
-    //   pmem_drain();
-    //   pm.update_metadata();
-    //   auto n = GET_CLHT_INDEX(hkey, TABLE_NUM);
-    //   clhts[n]->clht_put(hkey, offset);
-    //   return true;
-    // }
-    // else {
-    //   return true;
-    // }
+    if (addr == nullptr) {
+      auto len = p.size();
+      auto &pm = mmanager;
+      auto offset_and_addr = pm.halloc(len);
+      auto offset = offset_and_addr.first;
+      auto addr = offset_and_addr.second;
+      auto add = reinterpret_cast<long long *>(&p);
+      auto paddr = reinterpret_cast<long long *>(addr);
+      pmem_memcpy_persist(paddr, add, len);
+      pmem_drain();
+      pm.update_metadata();
+      auto n = GET_CLHT_INDEX(hkey, TABLE_NUM);
+      clhts[n]->clht_put(hkey, offset);
+      return true;
+    }
+    else {
+      return true;
+    }
     // check if the key exists
     if (addr != nullptr) {
       *r = EXIST;

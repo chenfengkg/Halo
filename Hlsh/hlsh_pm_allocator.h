@@ -30,29 +30,51 @@ namespace HLSH_hashing {
     static constexpr auto HLSH_FILE_OPEN_FLAGS = O_CREAT | O_RDWR | O_DIRECT;
     template <class KEY, class VALUE>
     class HLSH;
+    
+    uint64_t pmem_start_addr = 0;
 
+    inline size_t Round2StripeSize(size_t size) {
+        auto s = size % kStripeSize;
+        if (s) {
+            return ((size / kStripeSize) + 1) * kStripeSize;
+        }
+        return size;
+    }
 
     struct PmOffset {
-      uint64_t chunk_start_addr : 49;
+      uint64_t log_id: 6;
+      uint64_t chunk_id : 43;
       uint64_t offset : 15;
 
-      PmOffset() : chunk_start_addr(0), offset(0) {}
-      PmOffset(uint64_t csa, uint64_t of) : chunk_start_addr(csa), offset(of) {}
+      PmOffset() : log_id(0), chunk_id(0), offset(0) {}
+      PmOffset(uint64_t l, uint64_t c, uint64_t o) : log_id(l), chunk_id(c), offset(o) {}
       bool operator==(const PmOffset& other) const {
-        return chunk_start_addr == other.chunk_start_addr &&
+        return log_id==other.log_id&&chunk_id == other.chunk_id &&
                offset == other.offset;
       }
       void InitValue() {
-        chunk_start_addr = 0;
+        log_id = 0;
+        chunk_id = 0;
         offset = 0;
       }
-      void Set(uint64_t c, uint64_t o) {
-        chunk_start_addr = c;
-        offset = o;
-      }
-    }__attribute__((packed));
 
-    PmOffset PO_NULL(0, 0); //NULL offset for PM
+      void Set(uint64_t l, uint64_t c, uint64_t o) {
+          log_id = l;
+          chunk_id = c;
+          offset = o;
+      }
+
+      inline uint64_t GetValue() {
+          return pmem_start_addr + log_id * kChunkSize +
+                 chunk_id * kStripeSize + offset;
+      }
+
+      inline uint64_t GetChunk(){
+          return pmem_start_addr + log_id * kChunkSize + chunk_id * kStripeSize;
+      }
+    } PACKED;
+
+    PmOffset PO_NULL(0, 0, 0); // NULL offset for PM
 
     thread_local PmOffset tl_value = PO_NULL;
 
@@ -72,7 +94,7 @@ namespace HLSH_hashing {
       uint64_t free_size;
       uint64_t next;
 
-      size_t Recovery(size_t addr, HLSH<KEY, VALUE>* index) {
+      size_t Recovery(size_t log_id, size_t addr, HLSH<KEY, VALUE>* index) {
         size_t recovery_count = 0;
         size_t csize = 0;
         // s1: caclulate chunk addr for each chunk
@@ -82,7 +104,7 @@ namespace HLSH_hashing {
           auto p = reinterpret_cast<Pair_t<KEY, VALUE>*>(chunk_start_addr);
           if (p->get_flag() == FLAG_t::VALID)
           {
-              tl_value.Set(addr + id * kStripeSize, foffset.fo.offset);
+              tl_value.Set(log_id, id, foffset.fo.offset);
               index->Insert(p, 0, true);
               recovery_count++;
           }
@@ -156,15 +178,15 @@ namespace HLSH_hashing {
         }
 
         /*recovery for current chunk list*/
-        size_t Recovery(size_t tid) {
-            set_affinity(tid);
-            auto start_id = next;
+        size_t Recovery(size_t log_id) {
             size_t recovery_count = 0;
+            // s: set start chunk id
+            auto start_id = next;
             // s1: traverse chunk and recovery 
             while (start_id != kMaxIntValue) {
                 auto chunk_start_addr = addr + start_id * kStripeSize;
                 auto start_chunk = reinterpret_cast<PmChunk<KEY,VALUE>*>(chunk_start_addr);
-                recovery_count += start_chunk->Recovery(addr, index);
+                recovery_count += start_chunk->Recovery(log_id, addr, index);
                 start_id = start_chunk->next;
             }
             return recovery_count;
