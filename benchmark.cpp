@@ -19,10 +19,12 @@ using namespace pcm;
 // #define LATENCY
 // #define PM_PCM
 enum { OP_INSERT, OP_READ, OP_DELETE, OP_UPDATE };
+
 enum workload_type {
   YCSB,
   PiBench,
 };
+
 enum Hash {
   Halo_t,
   VIPER_t,
@@ -35,8 +37,9 @@ enum Hash {
 
 uint64_t LOAD_SIZE;
 uint64_t RUN_SIZE;
-uint64_t MAX_SIZE_LOAD = 200000000ULL;
-uint64_t MAX_SIZE_RUN = 200000000ULL;
+uint64_t MAX_SIZE_LOAD = 0ULL;
+uint64_t MAX_SIZE_RUN = 0ULL;
+
 void run_test(workload_type wlt, int num_thread, string load_data,
               string run_data, hash_api *&h, string workload) {
   char values[] =
@@ -72,61 +75,128 @@ void run_test(workload_type wlt, int num_thread, string load_data,
   string remove("REMOVE");
   string read("READ");
   string update("UPDATE");
-  ifstream infile_load(load_data);
-  string op;
-  uint64_t key;
-  uint64_t value_len;
+
+  // string op;
+  // uint64_t key;
+  // uint64_t value_len;
   vector<uint64_t> init_keys(MAX_SIZE_LOAD);
-  vector<uint64_t> keys(MAX_SIZE_RUN);
   vector<uint64_t> init_value_lens(MAX_SIZE_LOAD);
+  vector<uint64_t> keys(MAX_SIZE_RUN);
   vector<uint64_t> value_lens(MAX_SIZE_RUN);
   vector<int> ops(MAX_SIZE_RUN);
-  int count = 0;
-  while ((count < MAX_SIZE_LOAD) && infile_load.good()) {
-    infile_load >> op >> key >> value_len;
-    if (!op.size()) continue;
-    if (op.size() && op.compare(insert) != 0) {
-      cout << "READING LOAD FILE FAIL!\n";
-      cout << op << endl;
-      return;
+
+  // s: load data from load file
+  auto load_file = [&](size_t start, size_t end)
+  {
+    string line;
+    ifstream infile(load_data);
+    // s: move to specific position
+    for (size_t i = 0; i < start; i++)
+    {
+      getline(infile, line);
     }
-    init_keys[count] = key;
-    init_value_lens[count] = value_len;
-    count++;
+    // s: get value
+    string o;
+    uint64_t k;
+    uint64_t len;
+    for (size_t i = start; i < end; i++)
+    {
+      getline(infile, line);
+      stringstream ss(line);
+      ss >> o >> k >> len;
+      init_keys[i] = k;
+      init_value_lens[i] = len;
+    }
+    // s: close file
+    infile.close();
+  };
+
+  auto range = MAX_SIZE_LOAD / 36;
+  thread load_thread[36];
+  for (size_t i = 0; i < 36; i++)
+  {
+    if (i != 35)
+      load_thread[i] = thread(load_file, range * i, range * (i + 1));
+    else
+      load_thread[i] = thread(load_file, range * i, MAX_SIZE_LOAD);
   }
-  LOAD_SIZE = count;
-  infile_load.close();
-  if (workload == "ycsbe") LOAD_SIZE = 0;
-  fprintf(stderr, "Loaded %lu keys for initialing.\n", LOAD_SIZE);
+  for (size_t i = 0; i < 36; i++)
+  {
+    load_thread[i].join();
+  }
+
+  LOAD_SIZE = MAX_SIZE_LOAD; 
+  // if (workload == "ycsbe") LOAD_SIZE = 0;
+  printf("Loaded %lu keys for initialing.\n", LOAD_SIZE);
+
+  // s: load data from run file
+  auto run_file = [&](size_t start, size_t end)
+  {
+    string line;
+    ifstream infile(run_data);
+    // s: move to specific position
+    for (size_t i = 0; i < start; i++)
+    {
+      getline(infile, line);
+    }
+    // s: get value
+    string o;
+    uint64_t k;
+    uint64_t len;
+    for (size_t i = start; i < end; i++)
+    {
+      getline(infile, line);
+      stringstream ss(line);
+      ss >> o >> k;
+      if (o.compare(insert) == 0)
+      {
+        ss >> len;
+        ops[i] = OP_INSERT;
+        keys[i] = k;
+        value_lens[i] = len;
+      }
+      else if (o.compare(update) == 0)
+      {
+        ss >> len;
+        ops[i] = OP_UPDATE;
+        keys[i] = k;
+        value_lens[i] = len;
+      }
+      else if (o.compare(read) == 0)
+      {
+        ops[i] = OP_READ;
+        keys[i] = k;
+      }
+      else if (o.compare(remove) == 0)
+      {
+        ops[i] = OP_DELETE;
+        keys[i] = k;
+      }
+    }
+    // s: close file
+    infile.close();
+  };
+
+  thread run_thread[36];
+  range = MAX_SIZE_RUN / 36;
+  for (size_t i = 0; i < 36; i++)
+  {
+    if (i != 35)
+      run_thread[i] = thread(run_file, range * i, range * (i + 1));
+    else
+      run_thread[i] = thread(run_file, range * i, MAX_SIZE_RUN);
+  }
+
+  for (size_t i = 0; i < 36; i++)
+  {
+    run_thread[i].join();
+  }
+
 
   int *r = new int[1024];
-  ifstream infile_run(run_data);
-  count = 0;
-  while ((count < MAX_SIZE_RUN) && infile_run.good()) {
-    infile_run >> op >> key;
-    if (op.compare(insert) == 0) {
-      infile_run >> value_len;
-      ops[count] = OP_INSERT;
-      keys[count] = key;
-      value_lens[count] = value_len;
-    } else if (op.compare(update) == 0) {
-      infile_run >> value_len;
-      ops[count] = OP_UPDATE;
-      keys[count] = key;
-      value_lens[count] = value_len;
-    } else if (op.compare(read) == 0) {
-      ops[count] = OP_READ;
-      keys[count] = key;
-    } else if (op.compare(remove) == 0) {
-      ops[count] = OP_DELETE;
-      keys[count] = key;
-    } else {
-      continue;
-    }
-    count++;
-  }
-  RUN_SIZE = count;
 
+  RUN_SIZE = MAX_SIZE_RUN;
+  int count = MAX_SIZE_RUN;
 #if defined(HALOT)||defined(HLSHT)
 #ifdef NONVAR
   Pair_t<size_t, size_t> *p = new Pair_t<size_t, size_t>[RUN_SIZE];
@@ -137,7 +207,8 @@ void run_test(workload_type wlt, int num_thread, string load_data,
       new Pair_t<std::string, std::string>[RUN_SIZE];
 #endif
 #endif
-  fprintf(stderr, "Loaded %d keys for running.\n", count);
+  printf("Loaded %d keys for running.\n", count);
+
   Timer tr;
   tr.start();
   h = new hash_api();
@@ -364,6 +435,9 @@ int main(int argc, char **argv) {
   //   delete h;
   //   return 0;
   // }
+  char* end;
+  MAX_SIZE_LOAD = strtol(argv[3], &end, 10) * 1000000;
+  MAX_SIZE_RUN = strtol(argv[4], &end, 10) * 1000000;
   string workload = argv[1];
   workload_type wlt;
   string load_data = "";
@@ -386,23 +460,6 @@ int main(int argc, char **argv) {
   int num_thread = atoi(argv[2]);
   hash_api *h;
   run_test(wlt, num_thread, load_data, run_data, h, workload);
-  // auto pid = getpid();
-  // std::array<char, 128> buffer;
-  // std::unique_ptr<FILE, decltype(&pclose)> pipe(
-  //     popen(("cat /proc/" + to_string(pid) + "/status").c_str(), "r"),
-  //     pclose);
-  // if (!pipe) {
-  //   throw std::runtime_error("popen() failed!");
-  // }
-  // while (fgets(buffer.data(), buffer.size(), pipe.get()) != nullptr) {
-  //   string result = buffer.data();
-  //   if (result.find("VmRSS") != string::npos) {
-  //     std::string mem_ocp = std::regex_replace(
-  //         result, std::regex("[^0-9]*([0-9]+).*"), std::string("$1"));
-  //     printf("DRAM consumption: %.1f GB.\n", stof(mem_ocp) / 1024 / 1024);
-  //     break;
-  //   }
-  // }
 #ifdef SOFTT
   vmem_stats_print(vmp1, "");
 #elif PCLHTT

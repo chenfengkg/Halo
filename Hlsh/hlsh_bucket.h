@@ -6,25 +6,36 @@ namespace HLSH_hashing{
   constexpr int rFailureGetLock = -2;
   constexpr int rNoEmptySlot = -3;
   constexpr int rSegmentChanged = -4;
-  constexpr int rSplitSuccess = -5;
-  constexpr int rPreSegment = -6;
 
   constexpr size_t kFingerBits = 8;
   constexpr size_t kMask = (1 << kFingerBits) - 1;
+#define KEY_FINGER(hash) ((hash) & kMask);
+#define BUCKET_INDEX(hash) ((hash >> kFingerBits) & bucketMask)
 
-  constexpr size_t kNumBucket = 64; /* the number of normal buckets in one segment*/
-  constexpr size_t kSparePairNum = 256; /* the number of stash buckets in one segment*/
+#define SET_BIT16(m, b) (m |= (uint16_t)(1 << (b)))
+#define UNSET_BIT16(m, b) (m &= (~((uint16_t)(1 << (b)))))
+#define SET_BIT8(m, b) (m |= (uint8_t)(1 << (b)))
+#define UNSET_BIT8(m, b) (m &= (~((uint8_t)(1 << (b)))))
+#define UNSET_BITS(m, b) (m &= (~(b)))
+#define MASK(m, b) (m &= ((1 << (b)) - 1))
+
+  constexpr size_t kNumBucket = 128; /* the number of normal buckets in one segment*/
+  constexpr size_t kSpareBucketNum = 3;
+  constexpr size_t kSparePairNum = 64 * kSpareBucketNum; /* the number of stash buckets in one segment*/
   constexpr uint16_t kBucketNormalSlotNum = 6;
-  constexpr uint16_t kBucketSpareSlotNum = 10;
-  constexpr uint16_t kBucketTotalSlotNum = kBucketNormalSlotNum + kBucketSpareSlotNum;
+  // constexpr uint16_t kBucketSpareSlotNum = 10;
+  // constexpr uint16_t kBucketTotalSlotNum = kBucketNormalSlotNum + kBucketSpareSlotNum;
   constexpr uint16_t SlotMask = 15;
-  constexpr uint16_t kBucketFull = (uint16_t) - 1;
+  constexpr uint16_t kBucketFull = (1 << 12) - 1;
 
   constexpr size_t bucketMask = kNumBucket - 1;
-  constexpr size_t kSplitNum = 2;
-  constexpr size_t kSplitMask = (1UL << kSplitNum) - 1;
 
   std::atomic<uint64_t> count = {0};
+  std::atomic<uint64_t> count1 = {0};
+  std::atomic<uint64_t> count2 = {0};
+  std::atomic<uint64_t> count3 = {0};
+  std::atomic<uint64_t> count4 = {0};
+  std::atomic<uint64_t> count5 = {0};
 
   struct PrefetchValue
   {
@@ -47,9 +58,7 @@ namespace HLSH_hashing{
   constexpr size_t PrefetchNum = 12;
   thread_local PrefetchValue pv[PrefetchNum];
   thread_local size_t GetNum = 0;
-#define KEY_FINGER(hash) ((hash)&kMask);
-#define BUCKET_INDEX(hash) ((hash >> kFingerBits) & bucketMask)
-#define NEXT_BUCKET(y) (((y) & 1) ? ((y) - 1) : ((y) + 1))
+
 
   struct _Pair
   {
@@ -64,16 +73,7 @@ namespace HLSH_hashing{
       key = _key;
       value = _value;
     }
-
-    inline PmOffset GetValue()
-    {
-      return value;
-    }
-    inline uint64_t GetHash()
-    {
-      return key;
-    }
-  } __attribute__((packed));
+  } PACKED;
 
   struct Bitmap
   {
@@ -100,17 +100,15 @@ namespace HLSH_hashing{
       b = b & (~(1UL << index));
     }
 
-    inline void ClearBits(uint64_t invalid_bits)
-    {
-      b = b & (~invalid_bits);
-    }
-  } __attribute__((packed));
+  } PACKED;
 
   template <class KEY, class VALUE>
   struct SpareBucket
   {
-    Lock16 lock[4];    // 4B
-    Bitmap bitmap[4];  // 32B
+    Lock8 lock[kSpareBucketNum];    // 8B
+    uint8_t pad[8-kSpareBucketNum];   
+    Bitmap bitmap[kSpareBucketNum];  // 56B
+    uint64_t pad1[7 - kSpareBucketNum]; // 24B
     _Pair _[kSparePairNum];
 
     static size_t GetSize() { return kSparePairNum; }
@@ -122,7 +120,7 @@ namespace HLSH_hashing{
 
     SpareBucket()
     {
-      for (size_t i = 0; i < 4; i++)
+      for (size_t i = 0; i < kSpareBucketNum; i++)
       {
         lock[i].Init();
         bitmap[i].Init();
@@ -130,7 +128,7 @@ namespace HLSH_hashing{
     }
 
     inline void Init() {
-      for (size_t i = 0; i < 4; i++) {
+      for (size_t i = 0; i < kSpareBucketNum; i++) {
         lock[i].Init();
         bitmap[i].Init();
       }
@@ -138,11 +136,10 @@ namespace HLSH_hashing{
 
     inline int Insert(uint64_t key, PmOffset value, uint8_t finger)
     {
-      // s: loop traverse all stash slot
-      auto k = finger & 3;
-      for (size_t i = 0; i < 4; i++)
+      // s: loop traverse bucket
+      for (size_t i = 0; i < kSpareBucketNum; i++)
       {
-        auto m = (k + i) & 3;
+        auto m = ((finger % kSpareBucketNum) + i) % kSpareBucketNum;
         lock[m].GetLock();
         // s1: find empty slot
         auto slot = bitmap[m].FindEmptySlot();
@@ -167,8 +164,9 @@ namespace HLSH_hashing{
       return rNoEmptySlot;
     }
 
-    bool Delete(Pair_t<KEY, VALUE>* p, size_t key_hash, size_t position,
-                PmManage<KEY,VALUE>* pm) {
+    bool Delete(Pair_t<KEY, VALUE> *p, size_t key_hash, uint64_t position,
+                PmManage<KEY, VALUE> *pm)
+    {
       // s1: delete kv for varied-length kv
       if (_[position].key == key_hash) {
         auto o = _[position].value;
@@ -189,7 +187,6 @@ namespace HLSH_hashing{
     inline bool FindDuplicate(Pair_t<KEY, VALUE>* p, uint64_t key_hash,
                               uint64_t pos) {
       if (_[pos].key == key_hash) {
-        return true;
         auto o = _[pos].value;
         auto v = reinterpret_cast<Pair_t<KEY, VALUE>*>(o.GetValue());
         if (v->str_key() == p->str_key()) {
@@ -199,19 +196,14 @@ namespace HLSH_hashing{
       return rFailure;
     }
 
-    inline bool Get(Pair_t<KEY, VALUE>* p, uint64_t key_hash, uint64_t pos) {
+    inline int Get(Pair_t<KEY, VALUE>* p, uint64_t key_hash, uint64_t pos) {
       if (_[pos].key == key_hash)
       {
-        // return true;
         auto o = _[pos].value;
         // auto addr = reinterpret_cast<char *>(o.chunk_start_addr + o.offset);
         // pv[GetNum].kp.push_back(addr);
         // _mm_prefetch(addr,_MM_HINT_NTA);
-        auto k = reinterpret_cast<const __m128i *>(o.GetValue());
-        auto m = _mm_loadu_si128(k);
-        auto v = reinterpret_cast<Pair_t<KEY,VALUE>*>(&m);
-        // auto v = reinterpret_cast<Pair_t<KEY, VALUE> *>(o.chunk_start_addr + o.offset);
-        // if(v!=nullptr) return true;
+        auto v = reinterpret_cast<Pair_t<KEY, VALUE> *>(o.GetValue());
         if (v->str_key() == p->str_key())
         {
           p->load((char *)v);
@@ -234,76 +226,122 @@ namespace HLSH_hashing{
       }
       return rFailure;
     }
-  } __attribute__((packed));
+
+    bool UpdateForReclaim(Pair_t<KEY, VALUE> *p, uint64_t key_hash,
+                          PmOffset old_value, PmOffset new_value,
+                          uint64_t position, PmManage<KEY, VALUE> *pm)
+    {
+      if (_[position].key == key_hash)
+      {
+        // s2.1.1: obtain pointer to kv
+        if (_[position].value == old_value)
+        {
+          _[position].value = new_value;
+        };
+      }
+      return rFailure;
+    }
+  } PACKED;
 
   template <class KEY, class VALUE>
-  struct Bucket
+  struct BucketFirstLine
   {
-    VersionLock16 lock;      // 2B
-    uint16_t bitmap;       // 2B
-    uint8_t fingers[kBucketTotalSlotNum];
-    uint8_t s_pos[kBucketSpareSlotNum];
-    uint8_t pad[2];
-    _Pair slot[kBucketNormalSlotNum];
+    VersionLock16 lock; //2B
+    uint16_t bitmap;//2B
+    uint8_t fingers[12];//12
+    PmOffset value[kBucketNormalSlotNum];//48B
 
-    Bucket() : bitmap(0) { lock.Init(); }
-
-    inline void Init()
+    BucketFirstLine()
     {
       lock.Init();
       bitmap = 0;
     }
 
-    inline void BkLoadFactor(bool before_split)
+    inline void Init() 
     {
-      auto c = __builtin_popcount(bitmap);
-      auto f = (float)c / (float)kBucketTotalSlotNum;
-      if (before_split)
-        printf("b: bk load factor: %f\n", f);
-      else
-        printf("a: bk load factor: %f\n", f);
+      lock.Init();
+      bitmap = 0;
     }
 
-    inline int GetCount() { return __builtin_popcount(bitmap); }
+    inline int FindEmptySlot()
+    {
+      auto pos = __builtin_ctz(~bitmap);
+      if (pos < 12)
+        return pos;
+      return rNoEmptySlot;
+    }
+  } PACKED;
+
+  struct FSPos{
+    uint16_t finger:8;
+    uint16_t spos : 8;
+  } PACKED;
+
+  template <class KEY, class VALUE>
+  struct BucketSecondLine
+  {
+    uint8_t bitmap;//2B
+    uint8_t pad;
+    FSPos spos[7];  // 14B
+    uint64_t key[kBucketNormalSlotNum];//48B
+
+    BucketSecondLine()
+    {
+      bitmap = 0;
+    }
+
+    inline void Init()
+    {
+      bitmap = 0;
+    }
+
+    inline int FindEmptySlot()
+    {
+      auto pos = __builtin_ctz(~bitmap);
+      if (pos < 7)
+        return pos;
+      return rNoEmptySlot;
+    }
+  } PACKED;
+
+  template <class KEY, class VALUE>
+  struct Bucket
+  {
+    BucketFirstLine<KEY, VALUE> bf;
+    BucketSecondLine<KEY, VALUE> bs;
+
+    Bucket() {}
+
+    inline void Init()
+    {
+      bf.Init();
+      bs.Init();
+    }
+
+    inline int GetCount()
+    {
+      if (!CHECK_BIT(bf.bitmap, 12))
+      {
+        return __builtin_popcount(bf.bitmap);
+      }
+      else
+      {
+        auto b = bf.bitmap & (~(1 << 12));
+        return __builtin_popcount(b) + __builtin_popcount(bs.bitmap);
+      }
+    }
 
     static size_t GetSlotNum() { return kBucketNormalSlotNum; }
 
-    bool FindDuplicate(Pair_t<KEY, VALUE> *p, uint64_t key_hash, uint8_t finger, SpareBucket<KEY, VALUE> *sb)
+    bool FindDuplicate(Pair_t<KEY, VALUE> *p, uint64_t key_hash,
+                       uint8_t finger, SpareBucket<KEY, VALUE> *sb)
     {
-      // s: get possible slots by finger
-      auto mask = CMP128(fingers, finger);
-      // s: filter invalid slot
-      mask = mask & bitmap;
-      if (mask)
-      {
-        do
-        {
-          auto pos = __builtin_ctz(mask);
-          if (pos < kBucketNormalSlotNum) {
-            // s: search in normal bucket
-            if (slot[pos].key == key_hash) {
-              auto o = slot[pos].value;
-              auto v = reinterpret_cast<Pair_t<KEY, VALUE> *>(o.GetValue());
-              if (p->str_key() == v->str_key()) { return rSuccess; }
-            }
-          } else {
-            // s: search in spare bucket
-            auto r = sb->FindDuplicate(p, key_hash, s_pos[pos - kBucketNormalSlotNum]);
-            if (rSuccess == r){ return rSuccess; }
-          }
-          mask &= (~(1 << pos));
-        } while (mask);
-      }
-      return rFailure;
-    }
-
-    bool Update(Pair_t<KEY, VALUE> *p, uint64_t key_hash, uint8_t finger,
-                PmManage<KEY, VALUE> *pm, size_t thread_id, SpareBucket<KEY, VALUE> *sb)
-    {
-      // s: get possible slots by finger
-      auto mask = CMP128(fingers, finger);
-      // s: filter invalid slot
-      mask = mask & bitmap;
+      // s: compare finger with SIMD
+      auto mask = CMP128(bf.fingers, finger);
+      MASK(mask, 12);
+      // s: filter with bitmap
+      mask &= bf.bitmap;
+      // s: find duplicate kv
       if (mask)
       {
         do
@@ -312,148 +350,350 @@ namespace HLSH_hashing{
           if (pos < kBucketNormalSlotNum)
           {
             // s: search in normal bucket
-            if (slot[pos].key == key_hash)
+            auto o = bf.value[pos];
+            auto v = reinterpret_cast<Pair_t<KEY, VALUE> *>(o.GetValue());
+            if (p->str_key() == v->str_key())
             {
-              auto o = slot[pos].value;
+              return rSuccess;
+            }
+          }
+          else if (pos < 12)
+          {
+            // s: search in spare bucket
+            auto r = sb->FindDuplicate(p, key_hash,
+                                       bf.value[pos - kBucketNormalSlotNum].spos);
+            if (rSuccess == r)
+            {
+              return rSuccess;
+            }
+          }
+          UNSET_BIT16(mask, pos);
+        } while (mask);
+      }
+      // s: check spare slot
+      if (CHECK_BIT(bf.bitmap, 12))
+      {
+        for (size_t i = 0; i < 7; i++)
+        {
+          if (CHECK_BIT(bs.bitmap, i) && bs.spos[i].finger == finger)
+          {
+            // s: search in spare bucket
+            auto r = sb->FindDuplicate(p, key_hash, bs.spos[i].spos);
+            if (rSuccess == r)
+            {
+              return rSuccess;
+            }
+          }
+        }
+      }
+      return rFailure;
+    }
+
+    bool UpdateForReclaim(Pair_t<KEY, VALUE> *p, uint64_t key_hash,
+                          PmOffset old_value, PmOffset new_value,
+                          uint8_t finger, PmManage<KEY, VALUE> *pm,
+                          SpareBucket<KEY, VALUE> *sb)
+    {
+      // s: compare finger with SIMD
+      auto mask = CMP128(bf.fingers, finger);
+      MASK(mask, 12);
+      // s: filter with bitmap
+      mask &= bf.bitmap;
+      if (mask)
+      {
+        do
+        {
+          auto pos = __builtin_ctz(mask);
+          if (pos < kBucketNormalSlotNum)
+          {
+            // s: search in normal bucket
+            if (bf.value[pos] == old_value)
+            {
+              bf.value[pos] == new_value;
+              return rSuccess;
+            };
+          }
+          else if (pos < 12)
+          {
+            // s: search in spare bucket
+            auto r = sb->UpdateForReclaim(p, key_hash,
+                                          old_value, new_value,
+                                          bf.value[pos - kBucketNormalSlotNum].spos,
+                                          pm);
+            if (rSuccess == r)
+            {
+              return rSuccess;
+            }
+          }
+          UNSET_BIT16(mask, pos);
+        } while (mask);
+      }
+      // s: check spare slot
+      if (CHECK_BIT(bf.bitmap, 12))
+      {
+        for (size_t i = 0; i < 7; i++)
+        {
+          if (CHECK_BIT(bs.bitmap, i) && bs.spos[i].finger == finger)
+          {
+            // s: search in spare bucket
+            auto r = sb->UpdateForReclaim(p, key_hash,
+                                          old_value, new_value,
+                                          bs.spos[i].spos, pm);
+            if (rSuccess == r)
+            {
+              return rSuccess;
+            }
+          }
+        }
+      }
+      pm->Delete(old_value);
+      return rFailure;
+    }
+
+    bool Update(Pair_t<KEY, VALUE> *p, uint64_t key_hash, uint8_t finger,
+                PmManage<KEY, VALUE> *pm, size_t thread_id, SpareBucket<KEY, VALUE> *sb)
+    {
+      // s: compare finger with SIMD
+      auto mask = CMP128(bf.fingers, finger);
+      MASK(mask, 12);
+      // s: filter with bitmap
+      mask &= bf.bitmap;
+      if (mask)
+      {
+        do
+        {
+          auto pos = __builtin_ctz(mask);
+          if (pos < kBucketNormalSlotNum)
+          {
+            // s: search in normal bucket
+            auto o = bf.value[pos];
+            auto v = reinterpret_cast<Pair_t<KEY, VALUE> *>(o.GetValue());
+            if (p->str_key() == v->str_key())
+            {
+              bf.value[pos] = pm->Update(p, thread_id, bf.value[pos]);
+              return rSuccess;
+            }
+          }
+          else if (pos < 12)
+          {
+            // s: search in spare bucket
+            auto r = sb->Update(p, key_hash, thread_id, bf.value[pos - kBucketNormalSlotNum].spos, pm);
+            if (rSuccess == r)
+            {
+              return rSuccess;
+            }
+          }
+          UNSET_BIT16(mask, pos);
+        } while (mask);
+      }
+      // s: check spare slot
+      if (CHECK_BIT(bf.bitmap, 12))
+      {
+        for (size_t i = 0; i < 7; i++)
+        {
+          if (CHECK_BIT(bs.bitmap, i) && bs.spos[i].finger == finger)
+          {
+            // s: search in spare bucket
+            auto r = sb->Update(p, key_hash, thread_id, bs.spos[i].spos, pm);
+            if (rSuccess == r)
+            {
+              return rSuccess;
+            }
+          }
+        }
+      }
+      return rFailure;
+    }
+
+    inline int Get(Pair_t<KEY, VALUE> *p, uint64_t key_hash, uint8_t finger,
+            SpareBucket<KEY, VALUE> *sb)
+    {
+      // s: compare finger with SIMD
+      auto mask = CMP128(bf.fingers, finger);
+      MASK(mask, 12);
+      // s: filter with bitmap
+      mask &= bf.bitmap;
+      /* s: search normal and spare bucket */
+      if (mask)
+      {
+        auto num = __builtin_popcount(mask);
+        bool check_key_hash = false;
+        if (num > 1)
+          check_key_hash = true;
+        do
+        {
+          // return rSuccess;
+          auto pos = __builtin_ctz(mask);
+          if (pos < kBucketNormalSlotNum)
+          {
+            if (LIKELY(!check_key_hash))
+            {
+              // s: search in normal bucket
+              auto o = bf.value[pos];
               auto v = reinterpret_cast<Pair_t<KEY, VALUE> *>(o.GetValue());
               if (p->str_key() == v->str_key())
               {
-                // s: update kv only if key is euqal
-                slot[pos].value = pm->Update(p, thread_id, slot[pos].value);
+                count++;
+                p->load((char*)(v));
                 return rSuccess;
               }
             }
-          }
-          else
-          {
-            // s: update in spare bucket
-            auto r = sb->Update(p, key_hash, thread_id, s_pos[pos - kBucketNormalSlotNum], pm);
-            if (rSuccess == r)
-              return rSuccess;
-          }
-          mask &= (~(1 << pos));
-        } while (mask);
-      }
-      return rFailure;
-    }
-
-    bool Get(Pair_t<KEY, VALUE> *p, uint64_t key_hash, uint8_t finger, SpareBucket<KEY, VALUE> *sb)
-    {
-      // s: get possible slots by finger
-      auto mask = CMP128(fingers, finger);
-      // s: filter invalid slot
-      mask = mask & bitmap;
-      if (mask) {
-        // s: prefetch vector
-        do {
-          auto pos = __builtin_ctz(mask);
-          if (pos < kBucketNormalSlotNum) {
-            // s: search in normal bucket
-            if (slot[pos].key == key_hash) {
-              auto o = slot[pos].value;
-              auto k = reinterpret_cast<const __m128i *>(o.GetValue());
-              auto m = _mm_loadu_si128(k);
-              auto v = reinterpret_cast<Pair_t<KEY, VALUE> *>(&m);
-              // if (v != nullptr) return true;
-              // auto v = reinterpret_cast<Pair_t<KEY, VALUE> *>(o.chunk_start_addr + o.offset);
-              if (p->str_key() == v->str_key())
+            else
+            {
+              if (bs.key[pos] == key_hash)
               {
-                p->load(reinterpret_cast<char *>(v));
-                return rSuccess;
+                // s: search in normal bucket
+                auto o = bf.value[pos];
+                auto v = reinterpret_cast<Pair_t<KEY, VALUE> *>(o.GetValue());
+                if (p->str_key() == v->str_key())
+                {
+                  count2++;
+                  p->load((char *)(v));
+                  return rSuccess;
+                }
               }
             }
-          } else {
-            // s: search in spare bucket
-            auto r = sb->Get(p, key_hash, s_pos[pos - kBucketNormalSlotNum]);
-            if (rSuccess == r) return rSuccess;
           }
-          mask &= (~(1 << pos));
-        } while (mask);
+          else if (pos < 12)
+          {
+            // s: search in spare bucket
+            auto r = sb->Get(p, key_hash, bf.value[pos - kBucketNormalSlotNum].spos);
+            if (rSuccess == r)
+            {
+              count1++;
+              return rSuccess;
+            }
+          }
+          UNSET_BIT16(mask, pos);
+        } while (UNLIKELY(mask));
+      }
+      // s: check spare slot
+      if (UNLIKELY(CHECK_BIT(bf.bitmap, 12)))
+      {
+        for (size_t i = 0; i < 7; i++)
+        {
+          if (CHECK_BIT(bs.bitmap, i) && bs.spos[i].finger == finger)
+          {
+            // s: search in spare bucket
+            auto r = sb->Get(p, key_hash, bs.spos[i].spos);
+            if (rSuccess == r){
+              count2++;
+              return rSuccess;
+            }
+          }
+        }
       }
       return rFailure;
     }
 
-    /* set bitmap metadata */
-    inline void SetMeta(uint16_t bucket_slot, uint8_t finger) {
-      // s: set finger
-      fingers[bucket_slot] = finger;
-      // s: set bitmap
-      bitmap = bitmap | (1 << bucket_slot);
-    }
-
-    inline void SetMetaWithStash(int bucket_slot, int s_slot,
-                                 uint8_t finger) {
-      // s1: set finger
-      fingers[bucket_slot] = finger;
-      // s2: set pos for kv in spare bucket
-      s_pos[bucket_slot - kBucketNormalSlotNum] = s_slot;
-      // s3: set bitmap
-      bitmap = bitmap | (1 << bucket_slot);
-    }
-
-    inline void UnsetMeta(uint16_t index) {
-      // s1: update bitmap
-      bitmap &= (~(1 << index));
-    }
-
-    inline int FindEmptySlot(uint8_t finger) {
-      if (kBucketFull == bitmap)
-      {
-        return rNoEmptySlot;
-      }
-      return  __builtin_ctz(~bitmap);
-    }
-
-    inline int Insert(Pair_t<KEY, VALUE> *p, uint64_t key_hash, uint8_t finger,
-                      PmManage<KEY, VALUE> *pm, size_t thread_id, SpareBucket<KEY, VALUE> *sb)
+  inline int Insert(Pair_t<KEY, VALUE> *p, uint64_t key_hash, uint8_t finger,
+         PmManage<KEY, VALUE> *pm, size_t thread_id, SpareBucket<KEY, VALUE> *sb)
     {
       // s1: check whether exist duplicate key-value;
       if (FindDuplicate(p, key_hash, finger, sb))
         return rSuccess;
       // s2: insert key-value to pm
-      if (tl_value == PO_NULL) tl_value = pm->Insert(p, thread_id);
+      if (tl_value == PO_NULL)
+        tl_value = pm->Insert(p, thread_id);
       // s2: get empy slot if exist
-      auto pos = FindEmptySlot(finger);
-      if (rNoEmptySlot == pos) {
+      auto pos = FindEmptySlot();
+      if (rNoEmptySlot == pos)
+      {
         return rNoEmptySlot;
       }
       // s3: insert kv to bucket or stash
-      if (pos < kBucketNormalSlotNum) {
-        // s3.1: insert into slot in current bucket
-        slot[pos].value = tl_value;
-        slot[pos].key = key_hash;
-        SetMeta(pos, finger);
-      } else {
-        // s3.2: insert into slot in stash
+      if (pos < kBucketNormalSlotNum)
+      {
+        // s: insert into slot in current bucket
+        bf.value[pos] = tl_value;
+        bs.key[pos] = key_hash;
+        bf.fingers[pos] = finger;
+        SET_BIT16(bf.bitmap, pos);
+      }
+      else
+      {
+        // s: insert key and offset into stash
         auto k = sb->Insert(key_hash, tl_value, finger);
-        if (rNoEmptySlot != k) {
-          SetMetaWithStash(pos, k, finger);
-        } else {
+        if (rNoEmptySlot != k)
+        {
+          if (pos < 12)
+          {
+            bf.fingers[pos] = finger;
+            bf.value[pos - kBucketNormalSlotNum].spos = k;
+            SET_BIT16(bf.bitmap, pos);
+          }
+          else
+          {
+            auto q = pos - 12;
+            bs.spos[q].finger = finger;
+            bs.spos[q].spos = k;
+            SET_BIT8(bs.bitmap, q);
+            SET_BIT16(bf.bitmap, 12);
+          }
+        }
+        else
+        {
           return rNoEmptySlot;
         }
       }
       return rSuccess;
     }
 
-    inline int Insert(_Pair &p, uint8_t finger, SpareBucket<KEY, VALUE> *sb)
+    inline int FindEmptySlot()
+    {
+      auto pos = bf.FindEmptySlot();
+      if (pos != rNoEmptySlot)
+        return pos;
+      pos = bs.FindEmptySlot();
+      if (pos != rNoEmptySlot)
+        return 12 + pos;
+      return rNoEmptySlot;
+    }
+
+    inline int Insert(uint64_t key, PmOffset value, uint8_t finger,
+                      SpareBucket<KEY, VALUE> *sb)
     {
       // s1: get empy slot if exist
-      auto pos = FindEmptySlot(finger);
-      if (pos == rNoEmptySlot) {
+      auto pos = FindEmptySlot();
+      if (pos == rNoEmptySlot)
+      {
         return rNoEmptySlot;
       }
-      // s2: insert kv to bucket or stash
-      if (pos < kBucketNormalSlotNum) {
-        // s3.1: insert into slot in current bucket
-        slot[pos].value = p.value;
-        slot[pos].key = p.key;
-        SetMeta(pos, finger);
-      } else {
-        // s3.2: insert into slot in stash
-        auto k = sb->Insert(p.key, p.value, finger);
-        if (rNoEmptySlot != k) {
-          SetMetaWithStash(pos, k, finger);
-        } else {
+      /* s2: insert kv to normal bucket or spare bucket */
+      if (pos < kBucketNormalSlotNum)
+      {
+        /* s: insert into normal bucket */
+        // s: insert key and offset in current bucket
+        bf.value[pos] = value;
+        bs.key[pos] = key;
+        // s: update finger and bitmap
+        bf.fingers[pos] = finger;
+        bf.bitmap |= (1 << pos);
+      }
+      else
+      {
+        /* s: insert into spare bucket */
+        auto k = sb->Insert(key, value, finger);
+        if (rNoEmptySlot != k)
+        {
+          // s: update finger, spos, bitmap
+          if (pos < 12)
+          {
+            bf.fingers[pos] = finger;
+            bf.value[pos - kBucketNormalSlotNum].spos = k;
+            SET_BIT16(bf.bitmap, pos);
+          }
+          else
+          {
+            auto q = pos - 12;
+            bs.spos[q].finger = finger;
+            bs.spos[q].spos = k;
+            SET_BIT8(bs.bitmap, q);
+            SET_BIT16(bf.bitmap, 12);
+          }
+        }
+        else
+        {
           return rNoEmptySlot;
         }
       }
@@ -464,43 +704,63 @@ namespace HLSH_hashing{
     int Delete(Pair_t<KEY, VALUE> *p, uint64_t key_hash, uint8_t finger,
                PmManage<KEY, VALUE> *pm, SpareBucket<KEY, VALUE> *sb)
     {
-      // s: get possible slots by finger
-      auto mask = CMP128(fingers, finger);
-      // s: filter invalid slot
-      mask = mask & bitmap;
+      // s: compare finger with SIMD
+      auto mask = CMP128(bf.fingers, finger);
+      MASK(mask, 12);
+      // s: filter with bitmap
+      mask &= bf.bitmap;
       if (mask)
       {
         do
         {
           auto pos = __builtin_ctz(mask);
-          if (pos < kBucketNormalSlotNum) {
+          if (pos < kBucketNormalSlotNum)
+          {
             // s: search in normal bucket
-            if (slot[pos].key == key_hash) {
-              auto o = slot[pos].value;
-              auto v = reinterpret_cast<Pair_t<KEY, VALUE> *>(o.GetValue());
-              if (p->str_key() == v->str_key())
-              {
-                // s: delete kv only if key is euqal
-                pm->Delete(slot[pos].value);
-                UnsetMeta(pos);
-                return rSuccess;
-              }
-            }
-          } else {
-            // s: search in spare bucket
-            auto r = sb->Delete(p, key_hash,
-                                s_pos[pos - kBucketNormalSlotNum], pm);
-            if (rSuccess == r)
+            auto o = bf.value[pos];
+            auto v = reinterpret_cast<Pair_t<KEY, VALUE> *>(o.GetValue());
+            if (p->str_key() == v->str_key())
             {
-              UnsetMeta(pos);
+              pm->Delete(bf.value[pos]);
+              UNSET_BIT16(bf.bitmap, pos);
               return rSuccess;
             }
           }
-          mask &= (~(1 << pos));
+          else if (pos < 12)
+          {
+            // s: search in spare bucket
+            auto r = sb->Delete(p, key_hash, bf.value[pos - kBucketNormalSlotNum].spos, pm);
+            if (rSuccess == r)
+            {
+              UNSET_BIT16(bf.bitmap, pos);
+              return rSuccess;
+            }
+          }
+          UNSET_BIT16(mask, pos);
         } while (mask);
+      }
+      // s: check spare slot
+      if (CHECK_BIT(bf.bitmap, 12))
+      {
+        for (size_t i = 0; i < 7; i++)
+        {
+          if (CHECK_BIT(bs.bitmap, i) && bs.spos[i].finger == finger)
+          {
+            // s: search in spare bucket
+            auto r = sb->Delete(p, key_hash, bs.spos[i].spos, pm);
+            if (rSuccess == r)
+            {
+              UNSET_BIT8(bs.bitmap, i);
+              if (!bs.bitmap)
+              {
+                UNSET_BIT16(bf.bitmap, 12);
+              }
+              return rSuccess;
+            }
+          }
+        }
       }
       return rFailure;
     }
-  } __attribute__((packed));
-
+  } PACKED;
 }

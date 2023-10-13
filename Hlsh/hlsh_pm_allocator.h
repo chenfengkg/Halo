@@ -16,12 +16,13 @@ namespace HLSH_hashing {
     constexpr size_t kChunkNumPerDimm = kBlockSize / kChunkSize;
     constexpr size_t kStripeSize = kDimmNum * kBlockSize;
 
-    constexpr size_t kLogNum = kStripeSize / kChunkSize;
-    constexpr size_t kLogNumMask = kLogNum - 1;
+    constexpr size_t kListNum = kStripeSize / kChunkSize;
+    constexpr size_t kListNumMask = kListNum - 1;
 
-    constexpr size_t kReclaimThreshold = kChunkSize / 2;
-    constexpr size_t kReclaimChunkNum = 32;
+    constexpr size_t kMaxReclaimThreshold = kChunkSize / 2;
+    constexpr size_t kMinReclaimThreshold = kChunkSize / 32;
 
+    constexpr size_t kMaxThreadNum = 36;
     constexpr size_t kThreadNum = 36;
 
     static constexpr auto HLSH_MAP_PROT = PROT_WRITE | PROT_READ;
@@ -32,6 +33,7 @@ namespace HLSH_hashing {
     class HLSH;
     
     uint64_t pmem_start_addr = 0;
+    std::mutex list_lock[kListNum]; //chunk for each chunk list
 
     inline size_t Round2StripeSize(size_t size) {
         auto s = size % kStripeSize;
@@ -41,345 +43,706 @@ namespace HLSH_hashing {
         return size;
     }
 
-    struct PmOffset {
-      uint64_t log_id: 6;
-      uint64_t chunk_id : 43;
-      uint64_t offset : 15;
+    struct PmOffset
+    {
+        uint64_t spos : 8;
+        uint64_t chunk_addr: 42;
+        uint64_t offset : 14;
 
-      PmOffset() : log_id(0), chunk_id(0), offset(0) {}
-      PmOffset(uint64_t l, uint64_t c, uint64_t o) : log_id(l), chunk_id(c), offset(o) {}
-      bool operator==(const PmOffset& other) const {
-        return log_id==other.log_id&&chunk_id == other.chunk_id &&
-               offset == other.offset;
-      }
-      void InitValue() {
-        log_id = 0;
-        chunk_id = 0;
-        offset = 0;
-      }
+        PmOffset() : chunk_addr(0), offset(0) {}
+        PmOffset(uint64_t c, uint64_t o) : chunk_addr(c), offset(o) {}
+        bool operator==(const PmOffset &other) const
+        {
+            return chunk_addr == other.chunk_addr &&
+                   offset == other.offset;
+        }
 
-      void Set(uint64_t l, uint64_t c, uint64_t o) {
-          log_id = l;
-          chunk_id = c;
-          offset = o;
-      }
+        bool operator!=(const PmOffset &other) const
+        {
+            return !(chunk_addr == other.chunk_addr &&
+                     offset == other.offset);
+        }
 
-      inline uint64_t GetValue() {
-          return pmem_start_addr + log_id * kChunkSize +
-                 chunk_id * kStripeSize + offset;
-      }
+        PmOffset& operator=(const PmOffset& other){
+            // s: don't overwrite spos
+            chunk_addr = other.chunk_addr;
+            offset = other.offset;
+            return *this;
+        }
+        void InitValue()
+        {
+            chunk_addr = 0;
+            offset = 0;
+        }
 
-      inline uint64_t GetChunk(){
-          return pmem_start_addr + log_id * kChunkSize + chunk_id * kStripeSize;
-      }
+        void Set(uint64_t c, uint64_t o)
+        {
+            chunk_addr = c;
+            offset = o;
+        }
+
+        inline uint64_t GetValue()
+        {
+            return pmem_start_addr + chunk_addr + offset;
+        }
+
+        inline uint64_t GetChunk()
+        {
+            return pmem_start_addr + chunk_addr;
+        }
     } PACKED;
 
-    PmOffset PO_NULL(0, 0, 0); // NULL offset for PM
+    PmOffset PO_NULL(0, 0); // NULL offset for PM
+    PmOffset PO_DEFAULT(1, 0); // NULL offset for PM
 
     thread_local PmOffset tl_value = PO_NULL;
 
+    enum CHUNK_FLAG
+    {
+        FREE_CHUNK,
+        SERVICE_CHUNK, //inserting chunk
+        FULL_CHUNK
+    };
+
     union FlagOffset {
       struct {
-        uint64_t flag : 2;     // free_chunk:0, service_chunk:1, victim_chunk:2,
-                               // dest_chunk:3
-        uint64_t offset : 54;  // offset in chunk
+          uint64_t flag : 3;    // reference chunk_flag
+          uint64_t offset : 53; // offset in chunk
       } fo;
       uint64_t entire;
+
+      FlagOffset(uint64_t e)
+      {
+          entire = e;
+      }
     };
 
     template <class KEY, class VALUE>
     struct PmChunk {
       FlagOffset foffset;  // offset
-      uint64_t id;
+      uint64_t chunk_addr; // relative addr
       uint64_t free_size;
-      uint64_t next;
+      uint64_t next_chunk; //relative addr
+      // metadata for reclaim
+      uint64_t reclaim_pos;  //reclaim_pos
+      uint64_t dst_chunk1;  // 48(chunk_id) + 16(offset)
+      uint64_t dst_chunk2;
 
-      size_t Recovery(size_t log_id, size_t addr, HLSH<KEY, VALUE>* index) {
-        size_t recovery_count = 0;
-        size_t csize = 0;
-        // s1: caclulate chunk addr for each chunk
-        auto chunk_start_addr = addr + id * kStripeSize + sizeof(PmChunk<KEY,VALUE>);
-        // s2: traverse and insert valid key-value into index
-        while (csize < foffset.fo.offset) {
-          auto p = reinterpret_cast<Pair_t<KEY, VALUE>*>(chunk_start_addr);
-          if (p->get_flag() == FLAG_t::VALID)
+      inline void Recovery(size_t chunk_addr, HLSH<KEY, VALUE> *index)
+      {
+          // s1: caclulate chunk addr for each chunk
+          auto start_addr = pmem_start_addr + chunk_addr;
+          auto of = sizeof(PmChunk<KEY, VALUE>);
+          // s2: traverse and insert valid key-value into index
+          auto p = reinterpret_cast<Pair_t<KEY, VALUE> *>(start_addr);
+          while (!p->IsEnd())
           {
-              tl_value.Set(log_id, id, foffset.fo.offset);
-              index->Insert(p, 0, true);
-              recovery_count++;
+              if (p->IsValid())
+              {
+                  tl_value.Set(chunk_addr, of);
+                  index->Insert(p, 0, true);
+              }
+              of += p->size();
+              p = reinterpret_cast<Pair_t<KEY, VALUE> *>(start_addr + of);
           }
-          csize += p->size();
-          chunk_start_addr += p->size();
-        }
-        return recovery_count;
+          // s3: set flag
+          foffset.fo.flag = CHUNK_FLAG::FULL_CHUNK;
+          foffset.fo.offset = of;
+          clwb_sfence(&foffset, sizeof(FlagOffset));
       }
     };
 
     /*pm management for per list*/
     template <class KEY, class VALUE>
     struct PmChunkList {
-        uint64_t addr; //physic addr: metadata area
+        uint64_t chunk_list_addr; //physic addr: metadata area
+        uint64_t list_id; //id for list
         uint64_t next; // head for service_chunk_lists
         uint64_t cur;  // tail for service_chunk_lists
         uint64_t free; // head for free_chunk_lists
         uint64_t tail; // tail for free_chunk_lists
-        uint64_t prechunk_of_victim; // pre chunk for reclaim chunk
+        uint64_t previous_chunk_in_reclaim; // last chunk that searched in service chunk list
         uint64_t victim_chunk; // victim chunk
-        uint64_t dst_chunk; // destination_chunk
 
+        uint64_t dst_chunk; // destination_chunk that used to store the reclaimed kv pairs
         HLSH<KEY,VALUE>* index; //Index on DRAM
         uint64_t depth; // depth for hash table on DRAM
+        uint64_t total_chunk; // total chunk number
+        uint64_t used_chunk;  // has used chunk number, 49(start reclaim), 50(start get new chunk)
+        uint64_t start_chunk;// start chunk id
+        bool terminate_reclaim;
+        bool is_reclaim;
 
         /*first create*/
-        void Create(uint64_t physic_addr, uint64_t stripe_num, HLSH<KEY,VALUE>* _index) {
-            // s1: initial variable for chunk list head
-            addr = physic_addr;
+        void Create(uint64_t physic_addr, uint64_t id,
+                    uint64_t stripe_num, HLSH<KEY, VALUE> *_index)
+        {
+            // s1: initial metadata for chunk list head
+            chunk_list_addr = physic_addr;
+            list_id = id;
             next = kMaxIntValue;
-            cur = 0;
-            free = 1;
-            tail = stripe_num - 1;
+            cur = kMaxIntValue;
+            free = chunk_list_addr + kStripeSize;
+            tail = chunk_list_addr + (stripe_num - 1) * kStripeSize;
+            previous_chunk_in_reclaim = kMaxIntValue;
             victim_chunk = kMaxIntValue;
             dst_chunk = kMaxIntValue;
-            prechunk_of_victim = 0;
             index = _index;
-            // s2: initial meta for each chunk 
-            for (size_t i = 1;i < stripe_num;i++) {
+            total_chunk = stripe_num;
+            used_chunk = 0;
+            terminate_reclaim = true;
+            is_reclaim = false;
+            // s2: initial metadata for each chunk
+            for (size_t i = 1; i < stripe_num; i++)
+            {
                 // s2.1: get chunk address
-                auto chunk_addr = addr + i * kStripeSize;
-                auto chunk = reinterpret_cast<PmChunk<KEY,VALUE>*>(chunk_addr);
+                auto chunk_addr = chunk_list_addr + i * kStripeSize;
+                auto chunk = reinterpret_cast<PmChunk<KEY, VALUE> *>(
+                    pmem_start_addr + chunk_addr);
                 // s2.2: set chunk metadata
-                chunk->foffset.fo.flag = 0;
+                chunk->foffset.fo.flag = CHUNK_FLAG::FREE_CHUNK;
                 chunk->foffset.fo.offset = sizeof(PmChunk<KEY,VALUE>);
-                chunk->id = i;
+                chunk->chunk_addr = chunk_addr;
                 chunk->free_size = 0;
-                if ((stripe_num - 1) != i) { chunk->next = i + 1; }
-                else { chunk->next = kMaxIntValue; }
+                chunk->reclaim_pos = sizeof(PmChunk<KEY, VALUE>);
+                chunk->dst_chunk1 = kMaxIntValue;
+                chunk->dst_chunk2 = kMaxIntValue;
+                if ((stripe_num - 1) != i)
+                {
+                    chunk->next_chunk = chunk_addr + kStripeSize;
+                }
+                else
+                {
+                    chunk->next_chunk = kMaxIntValue;
+                }
                 // s2.3: persist chunk metadata
                 clwb_sfence(chunk, sizeof(PmChunk<KEY,VALUE>));
             }
             // s3: persist chunk list head
-            clwb_sfence(this, sizeof(PmChunkList<KEY,VALUE>));
+            clwb_sfence(this, sizeof(PmChunkList<KEY, VALUE>));
         }
 
-        void Print() {
+        void Print()
+        {
             auto k = free;
-            do {
-                auto chunk_addr = addr + k * kStripeSize;
-                auto chunk = reinterpret_cast<PmChunk<KEY,VALUE>*>(chunk_addr);
-                printf("%lu ", chunk->id);
-                k = chunk->next;
+            do
+            {
+                auto chunk = reinterpret_cast<PmChunk<KEY, VALUE> *>(
+                    pmem_start_addr + k);
+                uint64_t chunk_id = (free - chunk_list_addr) / kStripeSize;
+                printf("chunk_id: %lu\n", chunk_id);
+                k = chunk->next_chunk;
             } while (k != kMaxIntValue);
         }
 
         /* open*/
-        void open(uint64_t physic_addr, HLSH<KEY,VALUE>* _index) {
-            addr = physic_addr;
+        void Open(uint64_t physic_addr, HLSH<KEY, VALUE> *_index)
+        {
+            chunk_list_addr = physic_addr;
             index = _index;
+            start_chunk = next;
+            terminate_reclaim = true;
+            is_reclaim = false;
+        }
+
+        inline void RecoverAllocate()
+        {
+            /* s: allocate for normal process */
+            if (cur != kMaxIntValue)
+            {
+                auto cur_chunk = reinterpret_cast<PmChunk<KEY, VALUE> *>(
+                    pmem_start_addr + cur);
+                if (cur_chunk->next_chunk != kMaxIntValue)
+                {
+                    // s: recovery cur and free
+                    bool CurEqFree = false;
+                    if (cur == free)
+                    {
+                        // s3.2.4: move free to next chunk
+                        free = cur_chunk->next_chunk;
+                        clwb_sfence(this, CACHE_LINE_SIZE);
+                        CurEqFree = true;
+                    }
+                    cur_chunk->next_chunk = kMaxIntValue;
+                    clwb_sfence(&cur_chunk->next_chunk, sizeof(uint64_t));
+                    // s: recover used_chunk
+                    if (CurEqFree ||
+                        ((!CurEqFree) && CHECK_BITL(used_chunk, 50)))
+                    {
+                        used_chunk = UNSET_BITL(used_chunk, 50) + 1;
+                    }
+                    clwb_sfence(&used_chunk, sizeof(uint64_t));
+                    // s: recover dst_chunk
+                    if (dst_chunk == free)
+                    {
+                        dst_chunk = kMaxIntValue;
+                        clwb_sfence(&dst_chunk, sizeof(uint64_t));
+                    }
+                }
+                else
+                {
+                    // s: increase used chunk number
+                    if (CHECK_BITL(used_chunk, 50))
+                    {
+                        used_chunk = UNSET_BITL(used_chunk, 50) + 1;
+                        clwb_sfence(&used_chunk, sizeof(uint64_t));
+                    }
+                }
+            }
+            else
+            {
+                // s: crash from start
+                next = kMaxIntValue;
+                clwb_sfence(&next, sizeof(uint64_t));
+            }
+        }
+
+        inline void RecoverReclaim()
+        {
+            if (victim_chunk == kMaxIntValue)
+                return;
+            auto victim_chunk_addr = pmem_start_addr + victim_chunk;
+            auto chunk = reinterpret_cast<PmChunk<KEY, VALUE> *>(victim_chunk_addr); // victim chunk
+            if (chunk->reclaim_pos != kMaxIntValue)
+            {
+                // s1: pairs in victim chunks don't finish reclaiming
+                if (chunk->dst_chunk1 == kMaxIntValue)
+                    return;
+                auto chunk_num = chunk->dst_chunk1;
+                if (chunk->dst_chunk2 != kMaxIntValue){
+                    // s: check dst_chunk2 is valid
+                    auto dchunk = reinterpret_cast<PmChunk<KEY, VALUE> *>(
+                        pmem_start_addr + (chunk->dst_chunk2 >> 16)); // victim chunk
+                    auto dchunk_start = reinterpret_cast<uint64_t>(dchunk) +
+                                        sizeof(PmChunk<KEY, VALUE>);
+                    auto start_pair = reinterpret_cast<Pair_t<KEY, VALUE> *>(dchunk_start);
+                    if (!start_pair->IsEnd())
+                        chunk_num = chunk->dst_chunk2;
+                }
+                auto dst_chunk_addr = pmem_start_addr + (chunk_num >> 16);
+                auto dchunk = reinterpret_cast<PmChunk<KEY, VALUE> *>(dst_chunk_addr); // victim chunk
+                auto doffset = MASKL(chunk_num, 16);
+                auto dst_start = dst_chunk_addr + doffset;
+                auto dst = reinterpret_cast<Pair_t<KEY, VALUE> *>(dst_start);
+                auto next_dst = reinterpret_cast<Pair_t<KEY, VALUE> *>(dst_start + dst->size());
+                if (!dst->IsEnd())
+                {
+                    // s: find last pair in dst chunk
+                    while (!next_dst->IsEnd())
+                    {
+                        doffset += dst->size();
+                        dst_start += dst->size();
+                        dst = reinterpret_cast<Pair_t<KEY, VALUE> *>(dst_start);
+                        next_dst = reinterpret_cast<Pair_t<KEY, VALUE> *>(dst_start + dst->size());
+                    }
+                }
+                auto voffset = sizeof(PmChunk<KEY, VALUE>);
+                auto victim_start = victim_chunk_addr + voffset;
+                auto src = reinterpret_cast<Pair_t<KEY, VALUE> *>(victim_start);
+                if (!dst->IsEnd())
+                {
+                    // s: find corresponding pair in victim chunk
+                    while ((dst->str_key() != src->str_key()) &&
+                           (!src->IsEnd()))
+                    {
+                        voffset += src->size();
+                        victim_start += src->size();
+                        src = reinterpret_cast<Pair_t<KEY, VALUE> *>(victim_start);
+                    }
+                }
+                if (!dst->IsEnd())
+                {
+                    // s: update offset to next position for moving
+                    doffset += dst->size();
+                    dst_start += dst->size();
+                }
+                if (!src->IsEnd())
+                {
+                    voffset += src->size();
+                    victim_start += src->size();
+                }
+                printf("reclaim crash, list_id: %lu, voffset: %lu, doffset: %lu\n",
+                       list_id, voffset, doffset);
+                // s: restart move process
+                Move(chunk, victim_start, voffset, dchunk, dst_start, doffset);
+                return;
+            }
+            else
+            {
+                // s2: victim chunk don't link to free list
+                // s2.1: remove from service chunk list
+                if (previous_chunk_in_reclaim != kMaxIntValue)
+                {
+                    auto pchunk = reinterpret_cast<PmChunk<KEY, VALUE> *>(
+                        pmem_start_addr + previous_chunk_in_reclaim);
+                    if (pchunk->next_chunk == victim_chunk)
+                    {
+                        pchunk->next_chunk = chunk->next_chunk;
+                        clwb_sfence(&pchunk->next_chunk, sizeof(uint64_t));
+                    }
+                }
+                else
+                {
+                    if (next == victim_chunk)
+                    {
+                        next = chunk->next_chunk;
+                        clwb_sfence(&next, sizeof(uint64_t));
+                    }
+                }
+                // s2.2: append to the tail of free list
+                auto tchunk_addr = pmem_start_addr + tail;
+                auto tchunk = reinterpret_cast<PmChunk<KEY, VALUE> *>(tchunk_addr);
+                if (tchunk->next_chunk != victim_chunk)
+                {
+                    tchunk->next_chunk = victim_chunk;
+                    clwb_sfence(&tchunk->next_chunk, sizeof(uint64_t));
+                }
+                if (tail != victim_chunk)
+                {
+                    // s: move tail to the victim chunk and set victim chunk as the last chunk
+                    tail = victim_chunk;
+                    clwb_sfence(&tail, sizeof(uint64_t));
+                }
+                // s2.3: update the flag to indicate free chunk
+                chunk->foffset.fo.flag = CHUNK_FLAG::FREE_CHUNK;
+                chunk->foffset.fo.offset = sizeof(PmChunk<KEY, VALUE>);
+                chunk->free_size = 0;
+                chunk->dst_chunk2 = kMaxIntValue;
+                chunk->dst_chunk1 = kMaxIntValue;
+                chunk->next_chunk = kMaxIntValue;
+                // s: persist all metadata in one cacheline
+                clwb_sfence(chunk, CACHE_LINE_SIZE);
+                // s: decrease the used chunk num
+                if (CHECK_BITL(used_chunk, 49))
+                {
+                    auto uc = UNSET_BITL(used_chunk, 49) - 1;
+                    STORE(&used_chunk, uc);
+                    clwb_sfence(&used_chunk, sizeof(uint64_t));
+                }
+            }
+        }
+
+        inline void RecoverChunk(size_t chunk_addr)
+        {
+            // s: recovery chunk with chunk adddr
+            auto chunk = reinterpret_cast<PmChunk<KEY, VALUE> *>(
+                pmem_start_addr + chunk_addr);
+            chunk->Recovery(chunk_addr, index);
         }
 
         /*recovery for current chunk list*/
-        size_t Recovery(size_t log_id) {
-            size_t recovery_count = 0;
-            // s: set start chunk id
-            auto start_id = next;
-            // s1: traverse chunk and recovery 
-            while (start_id != kMaxIntValue) {
-                auto chunk_start_addr = addr + start_id * kStripeSize;
-                auto start_chunk = reinterpret_cast<PmChunk<KEY,VALUE>*>(chunk_start_addr);
-                recovery_count += start_chunk->Recovery(log_id, addr, index);
-                start_id = start_chunk->next;
-            }
-            return recovery_count;
-        }
-
-        inline uint64_t GetReclaimChunk() {
-            // s1: get start chunk for traverse by prechuk_of_victim
-            uint64_t prechunk_id = prechunk_of_victim, chunk_id = kMaxIntValue;
-            if (prechunk_id == 0) {
-                chunk_id = next;
-            }
-            else {
-                auto chunk_addr = addr + prechunk_id * kStripeSize;
-                auto chunk = reinterpret_cast<PmChunk<KEY,VALUE>*>(chunk_addr);
-                chunk_id = chunk->next;
-            }
-            // s2: determine victim chunk by reclaim threshold
-            while (1) {
-                if (chunk_id != kMaxIntValue) {
-                    auto chunk_addr = addr + chunk_id * kStripeSize;
-                    auto chunk = reinterpret_cast<PmChunk<KEY,VALUE>*>(chunk_addr);
-                    if (chunk.free_size < kReclaimThreshold)  break;
-                    prechunk_id = chunk_id;
-                    chunk_id = chunk->next;
+        void RecoverIndex()
+        {
+            // s: multiple thread travese the chunk list
+            auto sc = LOAD(&start_chunk);
+            while (sc != kMaxIntValue)
+            {
+                auto real_chunk_addr = pmem_start_addr + sc;
+                auto chunk = reinterpret_cast<PmChunk<KEY, VALUE> *>(
+                    real_chunk_addr);
+                if (CAS(&start_chunk, &sc, chunk->next_chunk))
+                {
+                    chunk->Recovery(sc, index);
+                    sc = LOAD(&start_chunk);
                 }
-                else return -1;
             }
-            prechunk_of_victim = prechunk_id;
-            victim_chunk = chunk_id;
-            clwb_sfence(this, kCacheLineSize);
-            return chunk_id;
-        }
-
-        /*garbage:  merge fragmented data*/
-        inline int Move2CurrentChunk() {
-            // s1: obtain pointer to victim chunk and set flag
-            auto chunk_addr = addr + victim_chunk * kStripeSize;
-            auto chunk = reinterpret_cast<PmChunk<KEY, VALUE>*>(
-                chunk_addr);  // victim chunk
-            chunk->foffset.fo.flag = 2;
-            clwb_sfence(&chunk->foffset, sizeof(uint64_t));
-
-            // s2: obtain pointer to destination chunk and set flag
-            auto dchunk = GetNewChunk(true);
-
-            // s3: move valid data from victim chunk to destination chunk
-            auto dst_start =
-                reinterpret_cast<uint64_t>(dchunk) + dchunk->foffset.fo.offset;
-            auto dst = reinterpret_cast<char*>(dst_start);
-            auto victim_start = chunk_addr + chunk->foffset.fo.offset;
-            auto src = reinterpret_cast<Pair_t<KEY, VALUE>*>(victim_start);
-            int len = 0, write_size = 0;
-            auto doffset = dchunk->foffset.fo.offset;
-            do {
-                auto kvsize = src->size();
-                if ((kChunkSize - doffset) < kvsize) {
-                    /* s3.1 destination chunk has full, flush destination chunk,
-                     * and switch to next chunk*/
-                    // s3.1.1 persist metadata for destination chunk
-                    clwb_sfence(reinterpret_cast<void*>(dst_start), write_size);
-                    dchunk->foffset.fo.offset += write_size;
-                    dchunk->foffset.fo.flag = 1;
-                    clwb_sfence(&dchunk->foffset, sizeof(FlagOffset));
-                    write_size = 0;
-                    // s3.1.2 get new destination chunk and update address for
-                    // insert
-                    dchunk = GetNewChunk(true);
-                    dst_start = reinterpret_cast<uint64_t>(dchunk) +
-                                dchunk->foffset.fo.offset;
-                    dst = reinterpret_cast<char*>(dst_start);
-                    doffset = dchunk->foffset.fo.offset;
-                }
-                if (src->flag) {
-                    /* s3.2 move valid data to destination chunk*/
-                    // s3.2.1 store into destination chunk
-                    src->store(dst);
-                    // s3.2.2 update index on DRAM
-                    tl_value.Set(reinterpret_cast<uint64_t>(dchunk), doffset);
-                    index->Insert(src, 0, true);
-                    // s3.2.3 next position in destination chunk
-                    dst += kvsize;
-                    doffset += kvsize;
-                    write_size += kvsize;
-                }
-                len += kvsize;
-                src +=
-                    reinterpret_cast<Pair_t<KEY, VALUE>*>(victim_start + len);
-            } while (len < chunk->offset.offset);
-
-            // s4: persist dst chunk data and metadata
-            clwb_sfence(reinterpret_cast<void*>(dst_start), write_size);
-            dchunk->foffset.fo.offset += write_size;
-            clwb_sfence(&dchunk->foffset, sizeof(uint64_t));
-
-            /* s6: move victim chunk to tail of the free list*/
-            // s6.1: separate victim chunk from service chunk list
-            auto pchunk_addr = addr + prechunk_of_victim * kStripeSize;
-            auto pchunk = reinterpret_cast<PmChunk<KEY, VALUE>*>(pchunk_addr);
-            pchunk->next = chunk->next;
-            // s6.2: append to the tail of free list
-            auto tchunk_addr = addr + tail * kStripeSize;
-            auto tchunk = reinterpret_cast<PmChunk<KEY, VALUE>*>(
-                tchunk_addr);  // destination chunk
-            tchunk->next = victim_chunk;
-            clwb_sfence(&tchunk->next, sizeof(uint64_t));
-            // s6.3: move tail to the victim chunk and set victim chunk as the
-            // last chunk
-            tail = victim_chunk;
-            clwb_sfence(&tail, sizeof(uint64_t));
-            chunk->next = kMaxIntValue;
-            // s6.4: update the flag to indicate free chunk
-            chunk->foffset.fo.flag = 0;
-            // s6.5: persist all metadata in one cacheline
-            clwb_sfence(chunk, CACHE_LINE_SIZE);
-
-            return 0;
         }
 
         /* reclaim process for current chunk list*/ 
         void Reclaim() {
-            for (size_t i = 0;i < kReclaimChunkNum;i++) {
+            printf("list: %lu, start reclaim\n", list_id);
+            STORE(&terminate_reclaim, false);
+            do
+            {
                 // s1: get victim chunk for specific chunk list
-                auto victim_chunk = GetReclaimChunk();
-                if (victim_chunk == -1) return;
+                GetReclaimChunk();
+                // s: terminate reclaim
+                if (LOAD(&terminate_reclaim))
+                    break;
                 // s2: move from victim chunk to destination chunk
                 Move2CurrentChunk();
-            }
+                // s: terminate reclaim if avalid chunk exceed threshold
+                if (used_chunk < (0.2 * total_chunk))
+                    break;
+            } while (1);
+            // s: indicate reclaim finish
+            STORE(&is_reclaim, false);
+            printf("list: %lu, end reclaim, used_chunk: %lu, total_chunk: %lu\n",
+                   list_id, used_chunk, total_chunk);
         }
 
+        inline void GetReclaimChunk()
+        {
+            auto reclaim_threshold = kMaxReclaimThreshold;
+            uint64_t version_pre_chunk = previous_chunk_in_reclaim;
+            // s1: get start chunk for traverse by prechuk_of_victim
+            if (previous_chunk_in_reclaim == kMaxIntValue)
+            {
+                victim_chunk = next;
+            }
+            else
+            {
+                auto pre_chunk = reinterpret_cast<PmChunk<KEY, VALUE> *>(
+                    pmem_start_addr + previous_chunk_in_reclaim);
+                victim_chunk = pre_chunk->next_chunk;
+            }
+            // s2: determine victim chunk by reclaim threshold
+            uint64_t last_reclaim_chunk = 0;
+            do
+            {
+                if (victim_chunk != cur)
+                {
+                    auto chunk = reinterpret_cast<PmChunk<KEY, VALUE> *>(
+                        pmem_start_addr + victim_chunk);
+                    auto f = LOAD(&chunk->foffset.entire);
+                    FlagOffset fo(f);
+                    auto free_size = (kChunkSize - fo.fo.offset) +
+                                     chunk->free_size;
+                    if ((fo.fo.flag == CHUNK_FLAG::FULL_CHUNK) &&
+                        (free_size > reclaim_threshold))
+                    {
+                        break;
+                    }
+                    if (victim_chunk == version_pre_chunk)
+                    {
+                        // s: search one cycle with no suitable chunk
+                        reclaim_threshold = reclaim_threshold / 2;
+                        if (reclaim_threshold < kMinReclaimThreshold)
+                        {
+                            STORE(&terminate_reclaim, true);
+                            printf("Warning: list_id %lu no space can be reclaimed!\n", list_id);
+                        }
+                    }
+                    previous_chunk_in_reclaim = victim_chunk;
+                    victim_chunk = chunk->next_chunk;
+                }
+                else
+                {
+                    // s: restart from the list head
+                    previous_chunk_in_reclaim = kMaxIntValue;
+                    victim_chunk = next;
+                }
+                if (LOAD(&terminate_reclaim))
+                {
+                    break;
+                }
+            } while (1);
+            clwb_sfence(&previous_chunk_in_reclaim, sizeof(uint64_t) * 2);
+        }
+
+        /*garbage:  merge fragmented data*/
+        inline void Move2CurrentChunk()
+        {
+            if (victim_chunk == kMaxIntValue)
+                return;
+            // s: obtain destination chunk 
+            auto dchunk = GetNewChunk(true);
+            auto doffset = dchunk->foffset.fo.offset;
+            auto dst_start = reinterpret_cast<uint64_t>(dchunk) + doffset;
+            // s: obtain victim chunk
+            auto chunk_addr = pmem_start_addr + victim_chunk;
+            auto chunk = reinterpret_cast<PmChunk<KEY, VALUE> *>(chunk_addr); // victim chunk
+            auto voffset = sizeof(PmChunk<KEY, VALUE>);
+            auto victim_start = chunk_addr + voffset;
+            // s: set dst_chunk1 for victim chunk
+            chunk->dst_chunk1 = (dchunk->chunk_addr << 16) + doffset;
+            clwb_sfence(&chunk->dst_chunk1, sizeof(uint64_t));
+            // s: start move data
+            Move(chunk, victim_start, voffset, dchunk, dst_start, doffset);
+        }
+
+        inline void Move(PmChunk<KEY, VALUE> *chunk, size_t victim_start,
+                         size_t voffset, PmChunk<KEY, VALUE> *dchunk,
+                         size_t dst_start, size_t doffset)
+        {
+            // s1: move valid data from victim chunk to destination chunk
+            auto src = reinterpret_cast<Pair_t<KEY, VALUE> *>(victim_start);
+            auto dst = reinterpret_cast<char *>(dst_start);
+            while (!src->IsEnd())
+            {
+                auto kvsize = src->size();
+                if (kChunkSize < (doffset + kvsize + sizeof(uint8_t)))
+                {
+                    /* s: destination chunk has full, flush destination chunk,
+                     * and switch to next chunk*/
+                    dchunk->foffset.fo.offset = doffset;
+                    dchunk->foffset.fo.flag = CHUNK_FLAG::FULL_CHUNK;
+                    clwb_sfence(&dchunk->foffset, sizeof(FlagOffset));
+                    // s: set dst_chunk as kMaxIntValue
+                    dst_chunk = kMaxIntValue;
+                    clwb_sfence(&dst_chunk, sizeof(uint64_t));
+                    // s: get new destination chunk 
+                    dchunk = GetNewChunk(true);
+                    // s: set dst_chunk as dst_chunk2
+                    chunk->dst_chunk2 = (dchunk->chunk_addr << 16) +
+                                        dchunk->foffset.fo.offset;
+                    clwb_sfence(&chunk->dst_chunk2, sizeof(uint64_t));
+                    // s: reset other variable
+                    doffset = dchunk->foffset.fo.offset;
+                    dst_start = reinterpret_cast<uint64_t>(dchunk) + doffset;
+                    dst = reinterpret_cast<char *>(dst_start);
+                }
+                if (src->IsValid())
+                {
+                    // s: store into destination chunk
+                    src->store_persist(dst);
+                    auto dk = reinterpret_cast<Pair_t<KEY, VALUE> *>(dst);
+                    // s: update index on DRAM
+                    auto src_chunk_addr = reinterpret_cast<uint64_t>(chunk) - pmem_start_addr;
+                    PmOffset old_value(src_chunk_addr, voffset);
+                    auto dst_chunk_addr = reinterpret_cast<uint64_t>(dchunk) - pmem_start_addr;
+                    PmOffset new_value(dst_chunk_addr, doffset);
+                    index->UpdateForReclaim(src, old_value, new_value);
+                    // s: next position in destination chunk
+                    doffset += kvsize;
+                    dst += kvsize;
+                }
+                voffset += kvsize;
+                victim_start += kvsize;
+                src = reinterpret_cast<Pair_t<KEY, VALUE> *>(victim_start);
+            }
+
+            // s: persist dst chunk metadata
+            dchunk->foffset.fo.offset = doffset;
+            clwb_sfence(&dchunk->foffset, sizeof(uint64_t));
+            // s: set bit to indicate that start reclaim process
+            {
+                std::lock_guard<std::mutex> lock(list_lock[list_id]);
+                used_chunk = SET_BITL(used_chunk, 49);
+            }
+            // s: indicate all valid pairs has been reclaimed in victim chunk
+            chunk->reclaim_pos = kMaxIntValue;
+            clwb_sfence(&chunk->reclaim_pos, sizeof(uint64_t));
+            // s: move victim chunk to free lsit
+            MoveVictimToFree(chunk);
+        }
+
+        inline void MoveVictimToFree(PmChunk<KEY, VALUE> *chunk)
+        {
+            std::lock_guard<std::mutex> lock(list_lock[list_id]);
+            // s1: separate victim chunk from service chunk list
+            if (previous_chunk_in_reclaim != kMaxIntValue)
+            {
+                auto pchunk = reinterpret_cast<PmChunk<KEY, VALUE> *>(
+                    pmem_start_addr + previous_chunk_in_reclaim);
+                pchunk->next_chunk = chunk->next_chunk;
+                clwb_sfence(&pchunk->next_chunk, sizeof(uint64_t));
+            }
+            else
+            {
+                next = chunk->next_chunk;
+                clwb_sfence(&next, sizeof(uint64_t));
+            }
+            // s2: append to the tail of free list
+            auto tchunk = reinterpret_cast<PmChunk<KEY, VALUE> *>(
+                pmem_start_addr + tail); // destination chunk
+            tchunk->next_chunk = victim_chunk;
+            clwb_sfence(&tchunk->next_chunk, sizeof(uint64_t));
+            // s: move tail to the victim chunk and set victim chunk as the last chunk
+            tail = victim_chunk;
+            clwb_sfence(&tail, sizeof(uint64_t));
+            // s3: update the flag to indicate free chunk
+            chunk->foffset.fo.flag = CHUNK_FLAG::FREE_CHUNK;
+            chunk->foffset.fo.offset = sizeof(PmChunk<KEY, VALUE>);
+            chunk->free_size = 0;
+            chunk->dst_chunk2 = kMaxIntValue;
+            chunk->dst_chunk1 = kMaxIntValue;
+            chunk->next_chunk = kMaxIntValue;
+            // s: persist all metadata in one cacheline
+            clwb_sfence(chunk, CACHE_LINE_SIZE);
+            // s4: decrease the used chunk num
+            used_chunk = UNSET_BITL(used_chunk, 49) - 1;
+            clwb_sfence(&used_chunk, sizeof(uint64_t));
+        }
+
+
+
         /*Get new chunk: relcaim thread or worker thread*/
-        PmChunk<KEY,VALUE>* GetNewChunk(bool is_for_reclaim = false) {
-            // s1: return reclaim chunk for reclaim thread directly if dst chunk is avaiable
-            if (is_for_reclaim) {
-                auto vchunk = reinterpret_cast<PmChunk<KEY,VALUE>*>(addr + dst_chunk * kStripeSize);
-                if (vchunk->foffset.fo.flag == 3) return vchunk;
-            }
-            // s2: contend new empty chunk by change flag with CAS
-            FlagOffset old_value, new_value;
-            uint64_t chunk_id = (uint64_t)-1;
-            PmChunk<KEY,VALUE>* chunk = nullptr;
-            do {
-                chunk_id = __atomic_load_n(&free, __ATOMIC_ACQUIRE);
-                if (kMaxIntValue == chunk_id) return nullptr;
-                auto chunk_addr = addr + free * kStripeSize;
-                chunk = reinterpret_cast<PmChunk<KEY,VALUE>*>(chunk_addr);
-                old_value.fo.flag = 0;
-                old_value.fo.offset = sizeof(PmChunk<KEY,VALUE>);
-                if (is_for_reclaim) new_value.fo.flag = 3;
-                else new_value.fo.flag = 1;
-                new_value.fo.offset = sizeof(PmChunk<KEY,VALUE>);
-            } while (!CAS(&chunk->foffset.entire, &old_value.entire, new_value.entire));
-            clwb_sfence(&chunk->foffset, sizeof(uint64_t));
-            // s3: link new chunk to sevices chunk list
-            if (is_for_reclaim) {
-                // s3.1: link new chunk to head for reclaim thread
-                // s3.1.1: new destination chunk
-                dst_chunk = chunk_id;
-                // s3.1.2: move free to next chunk
-                free = chunk->next;
-                clwb_sfence(this, CACHE_LINE_SIZE);
-                // s3.1.3: add new chunk to service chunk list 
-                chunk->next = next;
-                clwb_sfence(&chunk->next, sizeof(uint64_t));
-                next = chunk_id;
-                // s3.1.4: update prechunk_of_victim if it points to the head
-                if (prechunk_of_victim == 0)
-                    prechunk_of_victim = chunk_id;
-                clwb_sfence(this, CACHE_LINE_SIZE);
-            }
-            else {
-                // s3.2: link new chunk to cur for worker thread
-                // s3.2.1: link new chunk to service chunk list
-                if (0 == cur) {
-                    // s3.2.1.1: cur chunk is the head, make next pointer pointing to new chunk
-                    next = chunk_id;
-                    clwb_sfence(&next, sizeof(uint64_t));
+        PmChunk<KEY, VALUE> *GetNewChunk(bool is_for_reclaim = false)
+        {
+            std::lock_guard<std::mutex> lock(list_lock[list_id]);
+            if (is_for_reclaim)
+            {
+                // s1: return reclaim chunk for reclaim thread directly
+                //  if dst chunk is avaiable
+                if (dst_chunk != kMaxIntValue)
+                {
+                    auto vchunk = reinterpret_cast<PmChunk<KEY, VALUE> *>(
+                        pmem_start_addr + dst_chunk);
+                    return vchunk;
                 }
-                else {
-                    // s3.2.1.2: cur chunk is normal chunk
-                    auto cur_chunk_addr = addr + cur * kStripeSize;
-                    auto cur_chunk = reinterpret_cast<PmChunk<KEY,VALUE>*>(cur_chunk_addr);
-                    // s3.2.1.3: make next pointer of cur chunk pointing to new chunk
-                    cur_chunk->next = chunk_id;
-                    clwb_sfence(&chunk->next, sizeof(uint64_t));
+            }
+            if (((total_chunk - used_chunk) < 3) &&
+                (!is_for_reclaim))
+            {
+                // s: avoid no empty chunk for reclaim
+                return nullptr;
+            }
+            // s: get a new empty chunk
+            auto free_chunk_addr = LOAD(&free);
+            auto chunk = reinterpret_cast<PmChunk<KEY, VALUE> *>(
+                pmem_start_addr + free_chunk_addr);
+            chunk->foffset.fo.flag = CHUNK_FLAG::SERVICE_CHUNK;
+            chunk->foffset.fo.offset = sizeof(PmChunk<KEY, VALUE>);
+            chunk->reclaim_pos = sizeof(PmChunk<KEY, VALUE>);
+            clwb_sfence(&chunk->foffset, kCacheLineSize);
+            // s3: link chunk to sevices chunk list or free chunk list
+            // s3.1.1: set destination chunk that used to store the reclaimed kv pairs
+            if (is_for_reclaim)
+            {
+                auto end_flag = reinterpret_cast<uint8_t *>(
+                    pmem_start_addr + free_chunk_addr + sizeof(PmChunk<KEY, VALUE>));
+                *(end_flag) = kInvalidPair;
+                clwb_sfence(end_flag, sizeof(uint8_t));
+                dst_chunk = free_chunk_addr;
+                clwb_sfence(&dst_chunk, sizeof(dst_chunk));
+            }
+            /* s: link new chunk to tail for worker thread */
+            // s3.2.1: link new chunk to service chunk list
+            if (kMaxIntValue == cur)
+            {
+                /* s: cur chunk is the head */
+                // s: make next pointer pointing to new chunk
+                next = free_chunk_addr;
+                clwb_sfence(&next, sizeof(uint64_t));
+            }
+            else
+            {
+                /* s: cur chunk is not the head */
+                // s3.2.1.3: make next pointer of cur chunk pointing to new chunk
+                auto cur_chunk = reinterpret_cast<PmChunk<KEY, VALUE> *>(
+                    pmem_start_addr + cur);
+                cur_chunk->next_chunk = free_chunk_addr;
+                clwb_sfence(&chunk->next_chunk, sizeof(uint64_t));
+            }
+            // s3.2.3: make cur point to new chunk
+            cur = free_chunk_addr;
+            clwb_sfence(&cur, sizeof(uint64_t));
+            // s: set allocate flag
+            used_chunk = SET_BITL(used_chunk, 50);
+            clwb_sfence(&used_chunk, sizeof(uint64_t));
+            // s3.2.4: move free to next chunk
+            free = chunk->next_chunk;
+            clwb_sfence(&free, sizeof(uint64_t));
+            // s3.2.5: separate new chunk from free list
+            chunk->next_chunk = kMaxIntValue;
+            clwb_sfence(&chunk->next_chunk, sizeof(uint64_t));
+            // s: if avaliable chunk lower than threshold, reclaim process start
+            used_chunk = UNSET_BITL(used_chunk, 50) + 1;
+            clwb_sfence(&used_chunk, sizeof(uint64_t));
+            if (used_chunk > (total_chunk * 0.6))
+            {
+                // s: start reclaim thread due to less empty chunk
+                bool b = false;
+                if (CAS(&is_reclaim, &b, true))
+                {
+                    std::thread(&PmChunkList::Reclaim, this).detach();
                 }
-                // s3.2.3: make cur point to new chunk
-                cur = chunk_id;
-                // s3.2.4: move free to next chunk
-                free = chunk->next;
-                clwb_sfence(this, CACHE_LINE_SIZE);
-                // s3.2.5: separate new chunk from free list
-                chunk->next = kMaxIntValue;
-                clwb_sfence(&chunk->next, sizeof(uint64_t));
+            }
+            else if (used_chunk < (0.2 * total_chunk))
+            {
+                // s: enough chunk, can teminate reclaim thread for performance
+                STORE(&terminate_reclaim, true);
             }
             return chunk;
         }

@@ -15,9 +15,9 @@ namespace HLSH_hashing
 
         inline uint16_t GetVersionWithoutLock()
         {
-            auto old_value = __atomic_load_n(&version_lock, __ATOMIC_ACQUIRE);
+            auto old_value = LOAD(&version_lock);
             while (old_value & lockSet16) {
-                 old_value = __atomic_load_n(&version_lock, __ATOMIC_ACQUIRE);
+                old_value = LOAD(&version_lock);
             }
             return old_value;
         }
@@ -26,18 +26,17 @@ namespace HLSH_hashing
             uint16_t new_value = 0;
             uint16_t old_value = 0;
             do {
-                while (true)
-                {
-                    old_value = __atomic_load_n(&version_lock, __ATOMIC_ACQUIRE);
-                    if (!(old_value & lockSet16)) break;
-                }
+                do{
+                    old_value = LOAD(&version_lock);
+                }while(old_value & lockSet16);
                 new_value = old_value | lockSet16;
             } while (!CAS(&version_lock, &old_value, new_value));
         }
 
         inline bool TryGetLock() {
-            auto v = __atomic_load_n(&version_lock, __ATOMIC_ACQUIRE);
-            if (v & lockSet16) {
+            auto v = LOAD(&version_lock);
+            if (v & lockSet16)
+            {
                 return false;
             }
             auto old_value = v & lockMask16;
@@ -45,20 +44,21 @@ namespace HLSH_hashing
             return CAS(&version_lock, &old_value, new_value);
         }
 
-        inline void ReleaseLock() {
+        inline void ReleaseLock()
+        {
             auto v = version_lock;
-            __atomic_store_n(&version_lock, (v + 1) & lockMask16, __ATOMIC_RELEASE);
+            STORE(&version_lock, (v + 1) & lockMask16);
         }
 
         /*if the lock is set, return true*/
         inline bool TestLockSet(uint64_t &version) {
-            version = __atomic_load_n(&version_lock, __ATOMIC_ACQUIRE);
+            version = LOAD(&version_lock);
             return (version & lockSet16) != 0;
         }
 
         // test whether the version has change, if change, return true
         inline bool LockVersionIsChanged(uint16_t old_version) {
-            auto value = __atomic_load_n(&version_lock, __ATOMIC_ACQUIRE);
+            auto value = LOAD(&version_lock);
             return (old_version != value);
         }
     } PACKED;
@@ -76,7 +76,7 @@ namespace HLSH_hashing
             uint16_t old_value = 0;
             do {
                 while (true) {
-                    old_value = __atomic_load_n(&lock, __ATOMIC_ACQUIRE);
+                    old_value = LOAD(&lock);
                     if (!(old_value & lockSet16)) break;
                 }
                 new_value = old_value | lockSet16;
@@ -85,7 +85,7 @@ namespace HLSH_hashing
 
 
         inline void ReleaseLock() {
-            __atomic_store_n(&lock, 0, __ATOMIC_RELEASE);
+            STORE(&lock, 0);
         }
 
     } PACKED;
@@ -107,7 +107,7 @@ namespace HLSH_hashing
             {
                 while (true)
                 {
-                    old_value = __atomic_load_n(&version_lock, __ATOMIC_ACQUIRE);
+                    old_value = LOAD(&version_lock);
                     if (!(old_value & lockSet64))
                         break;
                 }
@@ -117,7 +117,7 @@ namespace HLSH_hashing
 
         inline bool TryGetLock()
         {
-            auto v = __atomic_load_n(&version_lock, __ATOMIC_ACQUIRE);
+            auto v = LOAD(&version_lock);
             if (v & lockSet64)
             {
                 return false;
@@ -130,20 +130,20 @@ namespace HLSH_hashing
         inline void ReleaseLock()
         {
             auto v = version_lock;
-            __atomic_store_n(&version_lock, (v + 1) & lockMask64, __ATOMIC_RELEASE);
+            STORE(&version_lock, (v + 1) & lockMask64);
         }
 
         /*if the lock is set, return true*/
         inline bool TestLockSet(uint64_t &version)
         {
-            version = __atomic_load_n(&version_lock, __ATOMIC_ACQUIRE);
+            version = LOAD(&version_lock);
             return (version & lockSet64) != 0;
         }
 
         // test whether the version has change, if change, return true
         inline bool TestLockVersionChange(uint64_t old_version)
         {
-            auto value = __atomic_load_n(&version_lock, __ATOMIC_ACQUIRE);
+            auto value = LOAD(&version_lock);
             return (old_version != value);
         }
     } __attribute__((packed));
@@ -157,7 +157,7 @@ namespace HLSH_hashing
 
         inline int TestLockSet(void)
         {
-            uint64_t v = __atomic_load_n(&lock, __ATOMIC_ACQUIRE);
+            uint64_t v = LOAD(&lock);
             return v & lockSet64;
         }
 
@@ -169,16 +169,19 @@ namespace HLSH_hashing
             {
                 while (true)
                 {
-                    old_value = __atomic_load_n(&lock, __ATOMIC_ACQUIRE);
-                    if (!(old_value & lockSet64)) break;
+                    old_value = LOAD(&lock);
+                    if (!(old_value & lockSet64))
+                        break;
                 }
                 new_value = old_value | lockSet64;
             } while (!CAS(&lock, &old_value, new_value));
         }
         // just set the lock as 0
-        void ReleaseLock() { __atomic_store_n(&lock, 0, __ATOMIC_RELEASE); }
-    }PACKED;
-
+        void ReleaseLock()
+        {
+            STORE(&lock, 0);
+        }
+    } PACKED;
 
     const uint8_t lockSet8 = ((uint8_t)1 << 7);
     const uint8_t lockMask8 = lockSet8 - 1;
@@ -198,7 +201,7 @@ namespace HLSH_hashing
             {
                 while (true)
                 {
-                    old_value = __atomic_load_n(&lock, __ATOMIC_ACQUIRE);
+                    old_value = LOAD(&lock);
                     if (!(old_value & lockSet8))
                         break;
                 }
@@ -208,7 +211,7 @@ namespace HLSH_hashing
 
         inline bool TryGetLock()
         {
-            auto old_value = __atomic_load_n(&lock, __ATOMIC_ACQUIRE);
+            auto old_value = LOAD(&lock);
             if (old_value & lockSet8)
             {
                 return false;
@@ -220,7 +223,7 @@ namespace HLSH_hashing
 
         inline void ReleaseLock()
         {
-            __atomic_store_n(&lock, 0, __ATOMIC_RELEASE);
+            STORE(&lock, 0);
         }
 
         void reset() { lock = 0; }

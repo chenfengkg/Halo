@@ -1,6 +1,6 @@
 CXX = g++
-CFLAGS = -std=c++17 -O3 -march=native -L./ -I./Halo 
-# CFLAGS = -std=c++17 -O0 -g -march=native -L./ -I./Halo 
+# CFLAGS = -std=c++17 -O3 -march=native -L./ -I./Halo 
+CFLAGS = -std=c++17 -O0 -g -march=native -L./ -I./Halo 
 
 CURR := $(shell pwd)
 CCEH_F := $(CFLAGS) -DCCEHT -std=c++17 -O3 -march=native \

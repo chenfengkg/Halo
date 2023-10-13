@@ -51,3 +51,6 @@ perf.*
 
 .vscode
 *.DS_Store
+
+#others
+*.txt

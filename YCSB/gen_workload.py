@@ -25,7 +25,7 @@ for line in f_config :
 
 ycsb_dir = 'YCSB/'
 workload_dir = 'workload_spec/'
-output_dir='workloads/'
+output_dir='workloads32/'
 
 workload = args[0]
 key_type = args[1]
@@ -38,8 +38,10 @@ ycsb_run = output_dir + 'Rycsb_run_' + key_type + '_' + workload
 load = output_dir +  'ycsb_load_' + workload
 run = output_dir + 'ycsb_run_' + workload
 
-cmd_ycsb_load = ycsb_dir + 'bin/ycsb.sh load basic -P ' + workload_dir + workload + ' -s > ' + ycsb_load
-cmd_ycsb_run = ycsb_dir + 'bin/ycsb.sh run basic -P ' + workload_dir + workload + ' -s > ' + ycsb_run
+cmd_ycsb_load = ycsb_dir + 'bin/ycsb.sh load basic -P ' + \
+    workload_dir + workload + ' -threads 72 ' + ' -s > ' + ycsb_load
+cmd_ycsb_run = ycsb_dir + 'bin/ycsb.sh run basic -P ' + \
+    workload_dir + workload + ' -threads 72 ' + ' -s > ' + ycsb_run
 
 print(cmd_ycsb_load)
 print(cmd_ycsb_run)

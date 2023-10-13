@@ -16,12 +16,20 @@ class hash_api {
 #else
   HLSH<std::string, std::string> *t;
 #endif
-  hash_api(size_t sz = 1024) {
+  hash_api(size_t sz = (1<<10)) {
+    PM_PATH = "/data/pmem0/";
     std::string hlsh = index_pool_name + "HLSH.data";
-    size_t hlsh_pool_size = 16ul * 1024ul * 1024Ul * 1024ul;
-    if(FileExists(hlsh.c_str())) FileRemove(hlsh.c_str());
+    size_t hlsh_pool_size = 8ul * 512ul * 1024Ul * 1024ul;
+    bool file_exist = false;
+    if (FileExists(hlsh.c_str()))
+    {
+      file_exist = true; /* FileRemove(hlsh.c_str()); */
+    }
 #ifdef NONVAR
-    t = new HLSH<size_t, size_t>(sz, hlsh.c_str(), hlsh_pool_size);
+    if (!file_exist)
+      t = new HLSH<size_t, size_t>(sz, hlsh.c_str(), hlsh_pool_size);
+    else
+      t = new HLSH<size_t, size_t>(hlsh.c_str(), hlsh_pool_size);
 #elif VARVALUE
     t = new HLSH<size_t, std::string>(sz, hlsh.c_str(), hlsh_pool_size);
 #else
@@ -47,8 +55,6 @@ class hash_api {
               int *r = nullptr) {
 #ifdef NONVAR
     Pair_t<size_t, size_t> p(key, *reinterpret_cast<size_t *>(value));
-    p.set_flag(FLAG_t::VALID);
-    p.set_version(0);
 #elif VARVALUE
     Pair_t<size_t, std::string> p(key, value, value_len);
 #else
@@ -103,7 +109,8 @@ class hash_api {
 #else
   Halo<std::string, std::string> *t;
 #endif
-  hash_api(size_t sz = 16 * 1024 * 1024) {
+  hash_api(size_t sz = 16 * 1024 * 1024)
+  {
     PM_PATH = "/data/pmem0/hash/HaLo/";
 #ifdef NONVAR
     t = new Halo<size_t, size_t>(sz);

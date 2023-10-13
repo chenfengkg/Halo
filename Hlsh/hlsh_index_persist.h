@@ -2,33 +2,107 @@
 
 namespace HLSH_hashing{
     template <class KEY, class VALUE>
+    struct Directory;
+
+    template <class KEY, class VALUE>
     struct PersistHash
     {
         bool Persisted; // true: persisted, false: do not persisted
         uint64_t capacity;   // length of directory
         uint64_t recovery_point[kThreadNum]; // recovery point for each thread
+        uint64_t last_chunk[kListNum];
         std::atomic<uint64_t> offset; //offset for current file 
         uint64_t seg[0];
 
+        inline bool IsPersisted()
+        {
+            return Persisted;
+        }
+
+        inline Directory<KEY, VALUE> *Recovery()
+        {
+            if (!Persisted)
+                return nullptr;
+            // s: allocate new dir
+            Directory<KEY, VALUE> *dir;
+            Directory<KEY, VALUE>::New(&dir, capacity, 0, nullptr, 64, nullptr, true);
+            size_t global_depth = log2(capacity);
+            dir->entries_update = true;
+            // s: travese and recover
+            auto base_addr = reinterpret_cast<uint64_t>(this);
+            size_t seg_id = 0;
+            auto load_seg = [&]()
+            {
+                auto sid = LOAD(&seg_id);
+                while (sid < capacity)
+                {
+                    auto real_addr = reinterpret_cast<void *>(base_addr + seg[sid]);
+                    auto pm_seg = reinterpret_cast<Segment<KEY, VALUE> *>(real_addr);
+                    size_t chunk_size = pow(2, global_depth - pm_seg->local_depth);
+                    if (CAS(&seg_id, &sid, sid + chunk_size))
+                    {
+                        Segment<KEY, VALUE>::New(&dir->_[sid], global_depth, sid);
+                        memcpy(dir->_[sid], real_addr, sizeof(Segment<KEY, VALUE>));
+                        // s: segment recovery
+                        dir->_[sid]->Recovery();
+                        for (size_t i = 1; i < chunk_size; i++)
+                        {
+                            dir->_[sid + i] = dir->_[sid];
+                        }
+                        sid = LOAD(&seg_id);
+                    }
+                }
+            };
+            std::vector<std::thread> vt;
+            for (size_t i = 0; i < kThreadNum; i++)
+            {
+                vt.push_back(std::thread(load_seg));
+            }
+            for (auto &t : vt)
+            {
+                t.join();
+            }
+            return dir;
+        }
+
         inline void wait()
         {
-            auto b = __atomic_load_n(&Persisted, __ATOMIC_ACQUIRE);
+            auto b = LOAD(&Persisted);
             while (!b)
             {
-                b = __atomic_load_n(&Persisted, __ATOMIC_ACQUIRE);
+                b = LOAD(&Persisted);
             };
         }
 
-        void Init(Directory<KEY, VALUE> *d, uint64_t rpoint[])
+        inline void Init(Directory<KEY, VALUE> *d)
         {
             // s: initialization persist information
-            __atomic_store_n(&Persisted, false, __ATOMIC_RELEASE);
+            STORE(&Persisted, false);
+            capacity = d->capacity;
+            // s: set offset
+            offset.store(sizeof(PersistHash<KEY, VALUE>) +
+                         sizeof(uint64_t) * capacity);
+            // s: persist
+            clwb_sfence(this, sizeof(PersistHash<KEY, VALUE>));
+        }
+
+        inline void Init(Directory<KEY, VALUE> *d,
+                         uint64_t rpoint[], uint64_t lchunk[])
+        {
+            // s: initialization persist information
+            STORE(&Persisted, false);
             capacity = d->capacity;
             // s: set recovery point
             for (size_t i = 0; i < kThreadNum; i++) {
                 recovery_point[i] = rpoint[i];
             }
-            offset.store(sizeof(PersistHash<KEY, VALUE>) + sizeof(uint64_t) * capacity);
+            // s: set last chunk
+            for (size_t i = 0; i < kListNum; i++)
+            {
+                last_chunk[i] = lchunk[i];
+            }
+            offset.store(sizeof(PersistHash<KEY, VALUE>) +
+                         sizeof(uint64_t) * capacity);
             // s: persist
             clwb_sfence(this, sizeof(PersistHash<KEY, VALUE>));
         }
@@ -49,7 +123,9 @@ namespace HLSH_hashing{
             // s: transfer to real address
             auto real_addr = reinterpret_cast<uint64_t>(this) + addr;
             // s: persist segment
-            memcpy_persist(reinterpret_cast<void *>(real_addr), reinterpret_cast<void *>(s), sizeof(Segment<KEY, VALUE>));
+            memcpy_persist512(reinterpret_cast<void *>(real_addr),
+                              reinterpret_cast<void *>(s),
+                              sizeof(Segment<KEY, VALUE>));
             // s: set nullptr which indicate that it don't need to persist
             s->ph = nullptr;
         }
@@ -72,8 +148,9 @@ namespace HLSH_hashing{
                 s = od->_[i / 2];
                 s->lock.GetLock();
                 // s: persist segment
-                if (s->ph)
+                if (s->ph){
                     PersistSegment(s);
+                }
                 // s: set entries for new directory
                 size_t chunk_size = pow(2, nd->global_depth - s->local_depth);
                 if (nd->_[i])
@@ -91,13 +168,17 @@ namespace HLSH_hashing{
                 s->lock.ReleaseLock();
                 i = i + chunk_size;
             }
-            __atomic_store_n(&Persisted, true, __ATOMIC_RELEASE);
+            STORE(&Persisted, true);
+            clwb_sfence(&Persisted, sizeof(Persisted));
+            STORE(&nd->entries_update, true);
         }
 
-        static PersistHash<KEY, VALUE> *CreateNewPersist(Directory<KEY, VALUE> *d, uint64_t size, uint64_t r_point[])
+        static PersistHash<KEY, VALUE> *CreateNewPersist(
+            Directory<KEY, VALUE> *d, uint64_t size,
+            uint64_t r_point[], uint64_t l_chunk[])
         {
             // s: generate file name
-            auto s = std::string("/data/pmem0/") + std::string("HLSH") + std::to_string(d->global_depth);
+            auto s = PM_PATH + std::string("DHLSH") + std::to_string(d->global_depth);
             auto index_file = s.c_str();
             // s: create and map new file
             auto fd = open(index_file, HLSH_FILE_OPEN_FLAGS, 0643);
@@ -115,7 +196,7 @@ namespace HLSH_hashing{
             close(fd);
             // s: init pm file
             auto index = reinterpret_cast<PersistHash<KEY, VALUE> *>(pmem_addr);
-            index->Init(d, r_point);
+            index->Init(d, r_point, l_chunk);
             return index;
         }
     };

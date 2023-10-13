@@ -94,6 +94,10 @@ constexpr bool LOGCLEAN = false;
 
 constexpr size_t DEAFULT_SEGMENT_SIZE = 16 * 1024 * 1024;
 
+static std::atomic<uint64_t> halo_count{0};
+static std::atomic<uint64_t> halo_count1{0};
+static std::atomic<uint64_t> halo_count2{0};
+
 void READ_LOCK();
 void WAIT_READ_LOCK();
 void RELEASE_READ_LOCK();
@@ -538,15 +542,16 @@ struct CLHT {
     } while (Unlikely(bucket != NULL));
     return {INVALID, 0};
   }
-  
+
+
   template<class KEY,class VALUE>
   bool clht_get(size_t key, Pair_t<KEY, VALUE> *p)
   {
     size_t bin = clht_hash(table, key);
     if (resize_lock) ;
     volatile Bucket *bucket = table->buckets + bin;
-    // auto bbb = bucket;
     uint32_t j;
+    int count = 0;
     do
     {
       for (j = 0; j < ENTRIES_PER_BUCKET; j++)
@@ -554,7 +559,6 @@ struct CLHT {
         clht_val_t val = bucket->val[j];
         if (bucket->key[j] == key)
         {
-          return true;
           if (Likely(bucket->val[j] == val))
           {
             auto page_index = val / PAGE_SIZE;
@@ -562,11 +566,13 @@ struct CLHT {
                                                             val % PAGE_SIZE);
             if (v->str_key() == p->str_key())
             {
+              p->load((char*)v);
               return true;
             }
           }
         }
       }
+      count++;
       bucket = (Bucket *)get_DPage_addr(bucket->next);
     } while (Unlikely(bucket != NULL));
     return false;
@@ -1070,6 +1076,9 @@ class Halo {
   ~Halo() {
     for (auto &&i : reclaim_threads) i.join();
     memory_manager_Pool.shutdown(clhts);
+    printf("count: %lu, count1: %lu, count2: %lu, total_count: %lu\n",
+           halo_count.load(), halo_count1.load(), halo_count2.load(),
+           halo_count.load() + halo_count1.load() + halo_count2.load());
   }
 
   bool Insert(Pair_t<KEY, VALUE> &p, int *r) {
@@ -1086,7 +1095,6 @@ class Halo {
       auto add = reinterpret_cast<long long *>(&p);
       auto paddr = reinterpret_cast<long long *>(addr);
       pmem_memcpy_persist(paddr, add, len);
-      pmem_drain();
       pm.update_metadata();
       auto n = GET_CLHT_INDEX(hkey, TABLE_NUM);
       clhts[n]->clht_put(hkey, offset);
@@ -1096,6 +1104,7 @@ class Halo {
       return true;
     }
     // check if the key exists
+    // auto addr = get_PM_addr(hkey);
     if (addr != nullptr) {
       *r = EXIST;
       WRITE_PASS_COUNT++;
@@ -1142,11 +1151,14 @@ class Halo {
   bool Get(Pair_t<KEY, VALUE> *p) {
     if (Unlikely(READ_BUFFER_SIZE == 1)) {
       auto hkey = hash_func(reinterpret_cast<void *>(p->key()), p->klen());
-      auto addr = get_PM_addr(hkey);
-      if (addr) {
-        p->load(addr);
-      }
+      // auto addr = get_PM_addr(hkey);
+      auto n = GET_CLHT_INDEX(hkey, TABLE_NUM);
+      auto r = clhts[n]->clht_get(hkey, p);
+      // if (addr) {
+      //   p->load(addr);
+      // }
       READ_LOCK();
+      // return r;
       return true;
     }
     BUFFER_READ[BUFFER_READ_COUNTER++] = p;

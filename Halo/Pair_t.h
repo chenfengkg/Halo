@@ -10,23 +10,29 @@ const size_t MAX_KEY_LEN = 512;
 using OP_VERSION = uint32_t;
 constexpr int OP_BITS = 2;
 constexpr int VERSION_BITS = sizeof(OP_VERSION) * 8 - OP_BITS;
+
+
 #pragma pack(1)
 template <typename KEY, typename VALUE>
-class Pair_t {
- public:
+class Pair_t
+{
+public:
   OP_VERSION op : OP_BITS;
   OP_VERSION version : VERSION_BITS;
   KEY _key;
   VALUE _value;
-  Pair_t() {
+  Pair_t()
+  {
     _key = 0;
     _value = 0;
   };
-  Pair_t(char *p) {
+  Pair_t(char *p)
+  {
     auto pt = reinterpret_cast<Pair_t<KEY, VALUE> *>(p);
     *this = *pt;
   }
-  void load(char *p) {
+  void load(char *p)
+  {
     auto pt = reinterpret_cast<Pair_t<KEY, VALUE> *>(p);
     *this = *pt;
   }
@@ -34,41 +40,54 @@ class Pair_t {
   KEY str_key() { return _key; }
   VALUE value() { return _value; }
   size_t klen() { return sizeof(KEY); }
-  Pair_t(KEY k, VALUE v) {
+  Pair_t(KEY k, VALUE v)
+  {
     _key = k;
     _value = v;
   }
   void set_key(KEY k) { _key = k; }
 
-  void store_persist(void *addr) {
+  void store_persist(void *addr)
+  {
     auto p = reinterpret_cast<void *>(this);
     auto len = size();
     memcpy(addr, p, len);
     pmem_persist(addr, len);
   }
+
   void store_persist_update(char *addr) { store_persist(addr); }
-  void store(void *addr) {
+
+  void store(void *addr)
+  {
     auto p = reinterpret_cast<void *>(this);
     auto len = size();
     memcpy(addr, p, len);
   }
-  void set_empty() {
+
+  void set_empty()
+  {
     _key = 0;
     _value = 0;
   }
+
   void set_version(OP_VERSION old_version) { version = old_version + 1; }
   void set_op(OP_t o) { op = static_cast<OP_VERSION>(o); }
   OP_t get_op() { return static_cast<OP_t>(op); }
-  void set_op_persist(OP_t o) {
+
+  void set_op_persist(OP_t o)
+  {
     op = static_cast<uint16_t>(o);
     pmem_persist(reinterpret_cast<char *>(this), 8);
   }
+
   // friend std::ostream &operator<<(std::ostream &out, Pair_t A);
-  size_t size() {
+  size_t size()
+  {
     auto total_length = sizeof(OP_VERSION) + sizeof(KEY) + sizeof(VALUE);
     return total_length;
   }
 };
+
 template <typename KEY>
 class Pair_t<KEY, std::string> {
  public:
