@@ -29,6 +29,11 @@ thread_local size_t BUFFER_READ_COUNTER(0);
 size_t PM_MemoryManager::PAGE_ID = 0;
 size_t DRAM_MemoryManager::PAGE_ID = 0;
 
+std::atomic<uint64_t> halo_count{0};
+std::atomic<uint64_t> halo_count1{0};
+std::atomic<uint64_t> halo_count2{0};
+std::atomic<uint64_t> halo_write_count{0};
+
 // ===========For reclaim=================
 std::mutex RECLAIM_MTX;
 atomic_bool RECLAIM(false);
@@ -241,6 +246,7 @@ void PM_MemoryManager::creat_new_space() {
   lock_guard<mutex> guard(PM_MemoryManager::mtx);
   if (base_addr) {
     update_metadata();
+    // halo_write_count += 1;
   }
   current_PAGE_ID = PAGE_ID++;
   base_addr = static_cast<char *>(
@@ -263,6 +269,7 @@ void PM_MemoryManager::creat_new_space() {
   // if crash here, we will get the largest PPAGE_ID as counter by scanning all
   // PPages.
   pmem_persist(&ROOT->CURRENT_PPAGE_ID[ID], sizeof(size_t));
+  // halo_write_count += 3;
   local_offset = PRESERVE_SIZE_EACH_PAGE;
 }
 

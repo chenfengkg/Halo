@@ -13,7 +13,7 @@ namespace HLSH_hashing
 
         inline void Init() { version_lock = 0; }
 
-        inline uint16_t GetVersionWithoutLock()
+        inline uint16_t GetVersion()
         {
             auto old_value = LOAD(&version_lock);
             while (old_value & lockSet16) {
@@ -22,15 +22,32 @@ namespace HLSH_hashing
             return old_value;
         }
 
-        inline void GetLock() {
-            uint16_t new_value = 0;
-            uint16_t old_value = 0;
-            do {
-                do{
+        // test whether the version has change, if change, return true
+        inline bool VersionIsChanged(uint16_t old_version)
+        {
+            auto value = LOAD(&version_lock);
+            return (old_version != value);
+        }
+
+        inline bool VersionIsChanged2(uint16_t old_version)
+        {
+            auto value = LOAD(&version_lock);
+            return (old_version != (value & lockMask16));
+        }
+
+        inline void GetLock()
+        {
+            uint16_t old_value = LOAD(&version_lock) & lockMask16;
+            uint16_t new_value = old_value | lockSet16;
+            while (!CAS(&version_lock, &old_value, new_value))
+            {
+                while (old_value & lockSet16)
+                {
+                    _mm_pause();
                     old_value = LOAD(&version_lock);
-                }while(old_value & lockSet16);
+                }
                 new_value = old_value | lockSet16;
-            } while (!CAS(&version_lock, &old_value, new_value));
+            }
         }
 
         inline bool TryGetLock() {
@@ -56,11 +73,6 @@ namespace HLSH_hashing
             return (version & lockSet16) != 0;
         }
 
-        // test whether the version has change, if change, return true
-        inline bool LockVersionIsChanged(uint16_t old_version) {
-            auto value = LOAD(&version_lock);
-            return (old_version != value);
-        }
     } PACKED;
 
     struct Lock16
@@ -176,6 +188,7 @@ namespace HLSH_hashing
                 new_value = old_value | lockSet64;
             } while (!CAS(&lock, &old_value, new_value));
         }
+        
         // just set the lock as 0
         void ReleaseLock()
         {
@@ -189,8 +202,8 @@ namespace HLSH_hashing
     struct Lock8
     {
         uint8_t lock;
-        Lock8() { lock = 0; }
 
+        Lock8() { lock = 0; }
         inline void Init() { lock = 0; }
 
         inline void GetLock()

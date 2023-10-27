@@ -35,6 +35,8 @@ namespace HLSH_hashing {
     uint64_t pmem_start_addr = 0;
     std::mutex list_lock[kListNum]; //chunk for each chunk list
 
+    std::atomic<uint64_t> hlsh_write_count{0};
+
     inline size_t Round2StripeSize(size_t size) {
         auto s = size % kStripeSize;
         if (s) {
@@ -120,8 +122,8 @@ namespace HLSH_hashing {
     template <class KEY, class VALUE>
     struct PmChunk {
       FlagOffset foffset;  // offset
-      uint64_t chunk_addr; // relative addr
       uint64_t free_size;
+      uint64_t chunk_addr; // relative addr
       uint64_t next_chunk; //relative addr
       // metadata for reclaim
       uint64_t reclaim_pos;  //reclaim_pos
@@ -730,20 +732,20 @@ namespace HLSH_hashing {
             // s: if avaliable chunk lower than threshold, reclaim process start
             used_chunk = UNSET_BITL(used_chunk, 50) + 1;
             clwb_sfence(&used_chunk, sizeof(uint64_t));
-            if (used_chunk > (total_chunk * 0.6))
-            {
-                // s: start reclaim thread due to less empty chunk
-                bool b = false;
-                if (CAS(&is_reclaim, &b, true))
-                {
-                    std::thread(&PmChunkList::Reclaim, this).detach();
-                }
-            }
-            else if (used_chunk < (0.2 * total_chunk))
-            {
-                // s: enough chunk, can teminate reclaim thread for performance
-                STORE(&terminate_reclaim, true);
-            }
+            // if (used_chunk > (total_chunk * 0.6))
+            // {
+            //     // s: start reclaim thread due to less empty chunk
+            //     bool b = false;
+            //     if (CAS(&is_reclaim, &b, true))
+            //     {
+            //         std::thread(&PmChunkList::Reclaim, this).detach();
+            //     }
+            // }
+            // else if (used_chunk < (0.2 * total_chunk))
+            // {
+            //     // s: enough chunk, can teminate reclaim thread for performance
+            //     STORE(&terminate_reclaim, true);
+            // }
             return chunk;
         }
     };

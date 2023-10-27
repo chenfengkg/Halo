@@ -873,6 +873,7 @@ clevel_hash<Key, T, Hash, KeyEqual, HashPower>::generic_insert(
 
   difference_type t_id = static_cast<difference_type>(thread_id);
   allocate_KV(pop, tmp_entry[t_id], param);
+  //clevel_write_count++;
   KV_entry_ptr_u created(tmp_entry[t_id].raw().off);
   created.x.partial = partial;
 
@@ -907,6 +908,7 @@ clevel_hash<Key, T, Hash, KeyEqual, HashPower>::generic_insert(
 #endif
     level_meta_ptr_t m_copy(meta);
     pop.persist(&(meta.off), sizeof(uint64_t));
+    //clevel_write_count++;
 
     size_type n_levels;
     uint64_t level_num = 0;
@@ -935,11 +937,12 @@ clevel_hash<Key, T, Hash, KeyEqual, HashPower>::generic_insert(
           // insertion to avoid missing the new item. The possible
           // duplication will be fixed in future updates and deletes.
           pop.persist(&(meta.off), sizeof(uint64_t));
+          //clevel_write_count++;
           check_duplicate = false;
           goto RETRY_INSERT;
         } else {
           pop.persist(&(e->off), sizeof(uint64_t));
-
+          //clevel_write_count++;
           return ret(expanded_flag, initial_capacity);
         }
       } else {
@@ -1135,6 +1138,7 @@ void clevel_hash<Key, T, Hash, KeyEqual, HashPower>::expand(
     pop.persist(tmp_level[t_id]->capacity);
     tmp_level[t_id]->up = nullptr;
     pop.persist(&(tmp_level[t_id]->up.off), sizeof(uint64_t));
+    //clevel_write_count += 3;
 
     // Append a new level.
     bool rc = CAS1(&(cl->up.off), 0, tmp_level[t_id].raw().off);
@@ -1142,7 +1146,7 @@ void clevel_hash<Key, T, Hash, KeyEqual, HashPower>::expand(
     if (rc == false) {
       // Ohter threads finished expanding
       pop.persist(&(cl->up.off), sizeof(uint64_t));
-
+      //clevel_write_count++;
       delete_persistent_atomic<bucket[]>(tmp_level[t_id]->buckets,
                                          new_capacity);
 
@@ -1165,7 +1169,7 @@ void clevel_hash<Key, T, Hash, KeyEqual, HashPower>::expand(
 
       if (CAS1(&(meta.off), m_copy.off, tmp_meta[t_id].raw().off)) {
         pop.persist(&(meta.off), sizeof(uint64_t));
-
+        //clevel_write_count++;
         std::cout << "Thread-" << thread_id
                   << " finishes expanding, capacity: " << capacity()
                   << std::endl;
@@ -1186,7 +1190,7 @@ void clevel_hash<Key, T, Hash, KeyEqual, HashPower>::expand(
   } else {
     // Ohter threads finished expanding
     pop.persist(&(cl->up.off), sizeof(uint64_t));
-
+    //clevel_write_count++;
     if (meta == m_copy) {
       size_type new_capacity = cl->capacity;
 
@@ -1204,6 +1208,7 @@ void clevel_hash<Key, T, Hash, KeyEqual, HashPower>::expand(
 
         if (CAS1(&(meta.off), m_copy.off, tmp_meta[t_id].raw().off)) {
           pop.persist(&(meta.off), sizeof(uint64_t));
+          //clevel_write_count++;
 
           std::cout << "Thread-" << thread_id
                     << " finishes expanding, capacity: " << capacity()

@@ -39,12 +39,15 @@
 #include <atomic>
 
 #include "ssmem.h"
+
+std::atomic<uint64_t> soft_write_count{0};
+
 ssmem_ts_t *ssmem_ts_list = nullptr;
 volatile uint32_t ssmem_ts_list_len = 0;
 __thread volatile ssmem_ts_t *ssmem_ts_local = nullptr;
 __thread size_t ssmem_num_allocators = 0;
 __thread ssmem_list_t *ssmem_allocator_list = nullptr;
-std::string PMEM_LOC1 = "/mnt/pmem/";
+std::string PMEM_LOC1 = "/data/pmem0/";
 unsigned long PM_POOL_SZ1 = 256UL * 1024 * 1024 * 1024;
 VMEM *vmp1 = vmem_create(PMEM_LOC1.c_str(), PM_POOL_SZ1);
 inline int ssmem_get_id() {
@@ -489,6 +492,7 @@ void *ssmem_alloc(ssmem_allocator_t *&a, size_t size, bool isPM) {
 
       a->mem_chunks = new_mem_chunks;
       BARRIER(&a->mem_chunks);
+      // soft_write_count++;
     }
 
     m = (void *)((char *)(a->mem) + a->mem_curr);

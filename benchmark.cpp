@@ -256,7 +256,10 @@ void run_test(workload_type wlt, int num_thread, string load_data,
     auto before_state = getSystemCounterState();
 #endif
     for (size_t i = 0; i < num_thread; i++) {
-      ths[i] = thread(insert, part * i, part, i);
+      if (i < (num_thread - 1))
+        ths[i] = thread(insert, part * i, part, i);
+      else
+        ths[i] = thread(insert, part * i, MAX_SIZE_LOAD - (part * i), i);
     }
     for (size_t i = 0; i < num_thread; i++) {
       ths[i].join();
@@ -369,7 +372,10 @@ void run_test(workload_type wlt, int num_thread, string load_data,
 #endif
   sw.start();
   for (size_t i = 0; i < num_thread; i++) {
-    ths[i] = thread(fun, part * i, part, i);
+    if (i < (num_thread - 1))
+      ths[i] = thread(fun, part * i, part, i);
+    else
+      ths[i] = thread(fun, part * i, MAX_SIZE_RUN - (part * i), i);
   }
   for (size_t i = 0; i < num_thread; i++) {
     ths[i].join();

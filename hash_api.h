@@ -16,10 +16,11 @@ class hash_api {
 #else
   HLSH<std::string, std::string> *t;
 #endif
-  hash_api(size_t sz = (1<<10)) {
+  hash_api(size_t sz = (1<<16))
+  {
     PM_PATH = "/data/pmem0/";
     std::string hlsh = index_pool_name + "HLSH.data";
-    size_t hlsh_pool_size = 8ul * 512ul * 1024Ul * 1024ul;
+    size_t hlsh_pool_size = 16ul * 1024ul * 1024Ul * 1024ul;
     bool file_exist = false;
     if (FileExists(hlsh.c_str()))
     {
@@ -210,6 +211,8 @@ class hash_api {
   }
   bool update(size_t key, size_t value_len, char *value, int tid = 0,
               int *r = nullptr) {
+    cceh->Delete(key);
+    cceh->Insert(key, DEFAULT);
     return false;
   }
   bool erase(size_t key, int tid = 0) {
@@ -254,6 +257,8 @@ class hash_api {
   }
   bool update(size_t key, size_t value_len, char *value, int tid = 0,
               int *r = nullptr) {
+    dash->Delete(key);
+    dash->Insert(key, DEFAULT);
     return false;
   }
 
@@ -291,7 +296,7 @@ class hash_api {
 
  public:
   hash_api(size_t sz = 1024 * 16, int tnum = 32) {
-    const char *path = "/data/pmem0/pmem.data ";
+    const char *path = "/data/pmem0/pmem.data";
     if (!std::filesystem::exists(path))
       pop =
           nvobj::pool<root>::create(path, LAYOUT, pool_size, S_IWUSR | S_IRUSR);
@@ -304,7 +309,10 @@ class hash_api {
     map = proot->cons;
     nvobj::transaction::commit();
   }
-  ~hash_api() { pop.close(); }
+  ~hash_api()
+  {
+    pop.close();
+  }
   std::string hash_name() { return "CLevel"; };
   bool find(size_t key) {
     pmem::obj::p<uint64_t> k = key;
@@ -404,6 +412,8 @@ constexpr size_t BUCKET_NUM = 16 * 1024 * 1024;
 class hash_api {
  public:
   hash_api() { table = new SOFTList<size_t>[BUCKET_NUM]; }
+  ~hash_api() { printf("extra write count: %lu\n", soft_write_count.load()); }
+
   std::string hash_name() { return "SOFT"; };
   bool insert(size_t key, size_t value_len, char *value, int tid,
               int *r = nullptr) {
@@ -413,6 +423,9 @@ class hash_api {
   }
   bool update(size_t key, size_t value_len, char *value, int tid,
               int *r = nullptr) {
+    SOFTList<size_t> &bucket = getBucket(key);
+    bucket.remove(key);
+    bucket.insert(key, key);
     return true;
   }
   void thread_ini(int id) {
@@ -456,11 +469,14 @@ class hash_api {
   hash_api() {
     const size_t inital_size = pool_size;
     index_pool_name += "VIPER.data";
+    const auto start = std::chrono::steady_clock::now();
     if (!std::filesystem::exists(index_pool_name))
       viper_db = viper::Viper<uint64_t, uint64_t>::create(index_pool_name,
                                                           inital_size);
-    else
+    else{
       viper_db = viper::Viper<uint64_t, uint64_t>::open(index_pool_name);
+    }
+
   }
   ~hash_api() {}
   std::string hash_name() { return "Viper"; };
@@ -477,6 +493,7 @@ class hash_api {
   }
   bool update(size_t key, size_t value_len, char *value,
               viper::Viper<uint64_t, uint64_t>::Client &c) {
+    c.remove(key);
     c.put(key, key + 1);
     return true;
   }

@@ -48,6 +48,8 @@ static constexpr version_lock_t NO_CLIENT_BIT = 0b01111111;
 static constexpr version_lock_t USED_BIT = 0b01000000;
 static constexpr version_lock_t UNLOCKED_BIT = 0b11111110;
 
+static std::atomic<uint64_t> viper_write_count{0};
+
 #define IS_LOCKED(lock) ((lock)&1)
 
 #define LINE_NUM (" (LINE: " + std::to_string(__LINE__) + ')')
@@ -545,6 +547,7 @@ Viper<K, V>::~Viper() {
     }
     close(v_base_.file_descriptor);
   }
+  //printf("extra_write_count: %lu\n", viper_write_count.load());
 }
 
 ViperInitData init_dram_pool(uint64_t pool_size, ViperConfig v_config,
@@ -1003,6 +1006,7 @@ void Viper<K, V>::get_block_based_access(Client* client) {
 
   v_base_.v_metadata->num_used_blocks.fetch_add(1, std::memory_order_relaxed);
   pmem_persist(v_base_.v_metadata, sizeof(ViperFileMetadata));
+  //viper_write_count++;
 }
 
 template <typename K, typename V>
@@ -1119,6 +1123,25 @@ inline bool Viper<K, V>::check_key_equality(const K& key,
 template <typename K, typename V>
 bool Viper<K, V>::Client::put(const K& key, const V& value,
                               const bool delete_old) {
+  {
+    // test CCEH
+    // const KVOffset kv_offset{0, 0, 0};
+    // KVOffset old_offset;
+
+    // if constexpr (using_fp)
+    // {
+    //   auto key_check_fn = [&](auto key, auto offset)
+    //   {
+    //     return this->viper_.check_key_equality(key, offset);
+    //   };
+    //   old_offset = this->viper_.map_.Insert(key, kv_offset, key_check_fn);
+    // }
+    // else
+    // {
+    //   old_offset = this->viper_.map_.Insert(key, kv_offset);
+    // }
+    // return true;
+  }
   v_page_->lock();
 
   // We now have the lock on this page
@@ -1129,6 +1152,7 @@ bool Viper<K, V>::Client::put(const K& key, const V& value,
     // Page is full. Free lock on page and restart.
     v_page_->unlock();
     update_access_information();
+    //viper_write_count++;
     return put(key, value, delete_old);
   }
 
@@ -1140,6 +1164,7 @@ bool Viper<K, V>::Client::put(const K& key, const V& value,
   free_slots->reset(free_slot_idx);
   pmem_persist(free_slots, sizeof(*free_slots));
 
+  //viper_write_count.fetch_add(2);
   // Store data in DRAM map.
   const KVOffset kv_offset{v_block_number_, v_page_number_, free_slot_idx};
   KVOffset old_offset;
@@ -1322,6 +1347,27 @@ bool Viper<K, V>::Client::get(const K& key, V* value) {
  */
 template <typename K, typename V>
 bool Viper<K, V>::ReadOnlyClient::get(const K& key, V* value) const {
+  {
+    // test cceh
+    // auto key_check_fn = [&](auto key, auto offset)
+    // {
+    //   if constexpr (using_fp)
+    //   {
+    //     return this->viper_.check_key_equality(key, offset);
+    //   }
+    //   else
+    //   {
+    //     return cceh::CCEH<K>::dummy_key_check(key, offset);
+    //   }
+    // };
+
+    // KVOffset kv_offset = this->viper_.map_.Get(key, key_check_fn);
+    // if (kv_offset.is_tombstone())
+    // {
+    //   return false;
+    // }
+    // return true;
+  }
   auto key_check_fn = [&](auto key, auto offset) {
     if constexpr (using_fp) {
       return this->viper_.check_key_equality(key, offset);

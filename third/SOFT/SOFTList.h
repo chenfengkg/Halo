@@ -95,6 +95,12 @@ class SOFTList {
 
  public:
   bool insert(uintptr_t key, T value) {
+    {
+      // test PM insert performance
+      // PNode<T> *newPNode = allocNewPNode();
+      // newPNode->create(key, value, true);
+      // return true;
+    }
     Node<T> *pred, *currRef;
     state currState, predState;
   retry:
@@ -111,7 +117,10 @@ class SOFTList {
         if (currState != state::INTEND_TO_INSERT) return false;
       } else {
         PNode<T> *newPNode = allocNewPNode();
+        // PNode<T> *newPNode = nullptr;
+        // soft_write_count++;
         bool pValid = newPNode->alloc();
+        // bool pValid = true;
         Node<T> *newNode = allocNewVolatileNode(key, value, newPNode, pValid);
         newNode->next.store(static_cast<Node<T> *>(softUtils::createRef(
                                 currRef, state::INTEND_TO_INSERT)),

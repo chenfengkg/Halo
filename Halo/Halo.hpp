@@ -92,11 +92,12 @@ extern bool RECLAIM_LOCK[CORE_NUM];
 constexpr bool SNAPSHOT = true;
 constexpr bool LOGCLEAN = false;
 
-constexpr size_t DEAFULT_SEGMENT_SIZE = 16 * 1024 * 1024;
+extern std::atomic<uint64_t> halo_count;
+extern std::atomic<uint64_t> halo_count1;
+extern std::atomic<uint64_t> halo_count2;
+extern std::atomic<uint64_t> halo_write_count;
 
-static std::atomic<uint64_t> halo_count{0};
-static std::atomic<uint64_t> halo_count1{0};
-static std::atomic<uint64_t> halo_count2{0};
+constexpr size_t DEAFULT_SEGMENT_SIZE = 16 * 1024 * 1024;
 
 void READ_LOCK();
 void WAIT_READ_LOCK();
@@ -130,6 +131,7 @@ struct PAGE_METADATA {
   size_t ALLOCATOR_ID;
   size_t RECLAIMED;
 };
+
 class MemoryManager {
  public:
   MemoryManager() {
@@ -620,10 +622,14 @@ struct CLHT {
           p->set_version(old->version);
           auto o_a = mmanager.halloc(p->size());
           p->store_persist(o_a.second);
+          // add persist
+          old->set_op_persist(OP_t::UPDATE);
           auto f = &reinterpret_cast<PAGE_METADATA *>(
                         PPage_table[old_offset / PAGE_SIZE].load())
                         ->FREED;
           r = __sync_fetch_and_add(f, old->size()) + old->size();
+          // add persist
+          pmem_persist(f, 8);
           *empty_v = o_a.first;
           LOCK_RLS(lock);
           return {r, old_offset};
@@ -758,7 +764,7 @@ struct CLHT {
     //        1.0 * num_buckets_new / 1024 / 1024);
     Segment *ht_new =
         clht_hashtable_create(num_buckets_new, ht_old->snapshot_version + 1);
-    auto checkpoint = nphase();
+    // auto checkpoint = nphase();
     int32_t b;
     for (b = 0; b < ht_old->num_buckets; b++) {
       Bucket *bu_cur = ht_old->buckets + b;
@@ -768,7 +774,7 @@ struct CLHT {
 
     swap_uint64((size_t *)&table, (size_t)ht_new);
     ht_old->table_new = ht_new;
-    ht_new->hallocD->persist(ht_new, checkpoint);
+    // ht_new->hallocD->persist(ht_new, checkpoint);
     ht_old->hallocD->reclaim(ht_old);
     TRYLOCK_RLS(resize_lock);
     return 1;
@@ -1079,11 +1085,38 @@ class Halo {
     printf("count: %lu, count1: %lu, count2: %lu, total_count: %lu\n",
            halo_count.load(), halo_count1.load(), halo_count2.load(),
            halo_count.load() + halo_count1.load() + halo_count2.load());
+    printf("extra_write_count: %lu\n", halo_write_count.load());
   }
 
   bool Insert(Pair_t<KEY, VALUE> &p, int *r) {
+    {
+      // test: test CRHT performance
+      // auto hkey = hash_func(reinterpret_cast<void *>(p.key()), p.klen());
+      // auto n = GET_CLHT_INDEX(hkey, TABLE_NUM);
+      // auto offset = clhts[n]->clht_get(hkey).first;
+      // if (offset == 1)
+      //   return true;
+      // clhts[n]->clht_put(hkey, 1);
+      // return true;
+    }
+
     if (Unlikely(mmanager.ID == -1))
       memory_manager_Pool.get_PM_MemoryManager(&mmanager);
+
+    {
+      // test: test pm allocator insert performance
+      // auto &pm = mmanager;
+      // auto len = p.size();
+      // auto offset_and_addr = pm.halloc(len);
+      // auto insert_addr = offset_and_addr.second;
+      // auto add = reinterpret_cast<long long *>(&p);
+      // auto paddr = reinterpret_cast<long long *>(insert_addr);
+      // pmem_memcpy_persist(paddr, add, len);
+      // pm.update_metadata();
+      // // halo_write_count.fetch_add(2);
+      // return true;
+    }
+
     auto hkey = hash_func(reinterpret_cast<void *>(p.key()), p.klen());
     auto addr = get_PM_addr(hkey);
     if (addr == nullptr) {
@@ -1096,6 +1129,7 @@ class Halo {
       auto paddr = reinterpret_cast<long long *>(addr);
       pmem_memcpy_persist(paddr, add, len);
       pm.update_metadata();
+      // halo_write_count.fetch_add(2);
       auto n = GET_CLHT_INDEX(hkey, TABLE_NUM);
       clhts[n]->clht_put(hkey, offset);
       return true;
@@ -1149,16 +1183,31 @@ class Halo {
   }
 
   bool Get(Pair_t<KEY, VALUE> *p) {
-    if (Unlikely(READ_BUFFER_SIZE == 1)) {
+    {
+      // test: test CRHT performance
+      // auto hkey = hash_func(reinterpret_cast<void *>(p->key()), p->klen());
+      // auto n = GET_CLHT_INDEX(hkey, TABLE_NUM);
+      // auto r = clhts[n]->clht_get(hkey).first;
+      // if (r == 1)
+      //   return true;
+      // return false;
+    }
+    {
+      // test: no read buffer performance
       auto hkey = hash_func(reinterpret_cast<void *>(p->key()), p->klen());
-      // auto addr = get_PM_addr(hkey);
       auto n = GET_CLHT_INDEX(hkey, TABLE_NUM);
       auto r = clhts[n]->clht_get(hkey, p);
-      // if (addr) {
-      //   p->load(addr);
-      // }
       READ_LOCK();
-      // return r;
+      return r;
+    }
+
+    if (Unlikely(READ_BUFFER_SIZE == 1)) {
+      auto hkey = hash_func(reinterpret_cast<void *>(p->key()), p->klen());
+      auto addr = get_PM_addr(hkey);
+      if (addr) {
+        p->load(addr);
+      }
+      READ_LOCK();
       return true;
     }
     BUFFER_READ[BUFFER_READ_COUNTER++] = p;

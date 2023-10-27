@@ -1,7 +1,7 @@
-#include "hlsh_preallocated.h"
+#include "hlsh_index_persist.h"
 
 namespace HLSH_hashing {
-std::atomic<uint64_t> insert_time;
+std::atomic<uint64_t> insert_num{0};
 
 template <class KEY, class VALUE>
 class HLSH {
@@ -23,15 +23,13 @@ class HLSH {
   inline bool UpdateForReclaim(Pair_t<KEY, VALUE> *p,
                                PmOffset old_value, PmOffset new_value);
   inline void DirectoryDouble();
-  inline void DirectoryUpdate(Directory<KEY, VALUE>* d,
-                              Segment<KEY, VALUE>* new_seg);
+  inline void DirectoryUpdate(Directory<KEY, VALUE> *d,
+                              Segment<KEY, VALUE> *new_seg);
   size_t GetDepth() { return dir->global_depth; }
 
-  size_t get_capacity() { return this->num_segment * Segment<KEY,VALUE>::GetSlotNum(); }
-
-  double get_load_factor() {
-    uint64_t capcity = get_capacity();
-    return (double)insert_time / (double)capcity;
+  double GetTotalSlot()
+  {
+      return segment_num * Segment<KEY, VALUE>::GetSlotNum();
   }
 
   void ShutDown() { clean = true; }
@@ -64,7 +62,8 @@ class HLSH {
     auto x = (key_hash >> (8 * sizeof(key_hash) - d->global_depth));
     // s2: get segment pointer from old dir if pointer is null
     auto seg = d->_[x];
-    if (d->_[x] == nullptr) {
+    if (d->_[x] == nullptr)
+    {
         seg = d->old_dir->_[x / 2];
     }
     return seg;
@@ -94,7 +93,7 @@ class HLSH {
       size_t chunk_size = pow(2, d->global_depth - seg->local_depth);
       // s2.2.3: update dir entries point to this valid segment
       for (int i = chunk_size - 1; i >= 0; i--) {
-        d->_[start_pos + i] = seg;
+          d->_[start_pos + i] = seg;
       }
       seg->lock.ReleaseLock();
     }
@@ -116,7 +115,7 @@ class HLSH {
             dir->_[i] = ptr;
         }
         // s: init PM management
-        pm = new PmManage<KEY,VALUE>(pool_file, pool_size, this);
+        pm = new PmManage<KEY, VALUE>(pool_file, pool_size, this);
         // s: crash or normal shutdown
         clean = false;
 
@@ -272,7 +271,7 @@ class HLSH {
     template <class KEY, class VALUE>
     HLSH<KEY, VALUE>::~HLSH(void) {
         // s: persist dram index
-        pm->Shutdown(dir);
+        // pm->Shutdown(dir);
         size_t total_usage =  sizeof(PmManage<KEY, VALUE>) + sizeof(HLSH<KEY, VALUE>);
         float tu = total_usage;
         printf("HLSH DRAM total_Usage: %fB, %fKB, %fMB, %fGB\n", tu, tu / (1024.0), tu / (1024.0 * 1024.0), tu / (1024.0 * 1024.0 * 1024.0));
@@ -280,33 +279,32 @@ class HLSH {
                count.load(), count1.load(), count2.load(), count.load() + count1.load() + count2.load());
         printf("count3: %lu, count4: %lu, count5: %lu, total: %lu\n",
                count3.load(), count4.load(), count5.load(), count3.load() + count4.load() + count5.load());
+        printf("extra_write_count: %lu\n", hlsh_write_count.load());
     }
 
     template <class KEY, class VALUE>
-    void HLSH<KEY, VALUE>::DirectoryUpdate(Directory<KEY, VALUE>* d,
-                                           Segment<KEY, VALUE>* new_seg) {
+    void HLSH<KEY, VALUE>::DirectoryUpdate(Directory<KEY, VALUE> *d,
+                                           Segment<KEY, VALUE> *new_seg)
+    {
         // s1: calculate start pos and range
         size_t depth_diff = d->global_depth - new_seg->local_depth;
         auto start_pos = new_seg->pattern << depth_diff;
         size_t chunk_size = pow(2, depth_diff);
         // s2: update entries
-        for (int i = chunk_size - 1; i >= 0; i--) {
-            d->_[start_pos + i] = new_seg;
+        for (int k = 0; k < chunk_size; k++)
+        {
+            d->_[start_pos++] = new_seg;
         }
     }
 
     template <class KEY, class VALUE>
-    void HLSH<KEY, VALUE>::DirectoryDouble() {
+    void HLSH<KEY, VALUE>::DirectoryDouble()
+    {
         // s1: persist new depth into PM
         auto global_depth = dir->global_depth;
-        pm->SetDepth(global_depth + 1);
+        // pm->SetDepth(global_depth + 1);
         if (dir->NeedPersist())
         {
-            // s: crash
-            // if (global_depth == 17)
-            // {
-            //     exit(0);
-            // }
             // s: wait until old persist thread finish
             if (dir->ph)
                 dir->ph->wait();
@@ -338,28 +336,41 @@ class HLSH {
             // s: start background thread to persist segment
             std::thread t(&PersistHash<KEY, VALUE>::BackPersistSegment, persist_index, dir, dir->old_dir);
             t.detach();
+            // s: release lock
+            dir_lock.ReleaseLock();
         }
         else
         {
+            // s: wait last directory entries udpate
+            while (!LOAD(&dir->entries_update))
+            {
+                asm("nop");
+            }
             // s: allocate new directory
             auto capacity = pow(2, global_depth + 1);
-            Directory<KEY, VALUE>::New(&back_dir, capacity, dir->version + 1, dir, dir->interval + 1, nullptr);
+            Directory<KEY, VALUE>::New(&back_dir, capacity, dir->version + 1,
+                                       dir, dir->interval + 1, nullptr);
             // s: set new dir to dir
             STORE(&dir, back_dir);
             // s: set entries for new dir
             auto nd = dir;
-            auto od = dir->old_dir;
+            auto od = nd->old_dir;
+            dir_lock.ReleaseLock();
             for (size_t i = 0; i < nd->capacity;)
             {
                 // s: check whether the entry is updated
                 auto s = nd->_[i];
-                if (s) {
-                    do {
+                if (s)
+                {
+                    do
+                    {
                         i++;
-                        if (i >= nd->capacity) break;
+                        if (i >= nd->capacity)
+                            break;
                         s = nd->_[i];
                     } while (s);
-                    if (i >= nd->capacity) break;
+                    if (i >= nd->capacity)
+                        break;
                 }
                 // s: get lock
                 s = od->_[i / 2];
@@ -381,21 +392,29 @@ class HLSH {
                 s->lock.ReleaseLock();
                 i = i + chunk_size;
             }
-            STORE(&dir->entries_update, true);
+            STORE(&nd->entries_update, true);
         }
         // s: print directory
-        printf("DirectoryDouble towards->%u\n", global_depth + 1);
+        // printf("DirectoryDouble towards->%u\n", global_depth + 1);
     }
 
     /* insert key_value to dash */
     template <class KEY, class VALUE>
     bool HLSH<KEY,VALUE>::Insert(Pair_t<KEY, VALUE>* p, size_t thread_id,
                         bool is_recovery) {
+        // insert_num++;
+        // if (!(insert_num % 40000))
+        // {
+        //     auto total_slot = GetTotalSlot();
+        //     auto lf = (insert_num.load() * 1.0) / total_slot;
+        //     printf("loadfactor: %lf\n", lf);
+        // }
+        // pm->Insert(p, thread_id);
+        // return true;
         // s1: insert kv-pair to pm except recovery
         if (!is_recovery)
         {
             tl_value.InitValue();
-            // tl_value = PO_DEFAULT;
         }
         // s2: caculate hash value for key-value pair
         uint64_t key_hash = h(p->key(), p->klen());
@@ -456,7 +475,6 @@ class HLSH {
                     goto RETRY;
                 }
                 DirectoryDouble();
-                dir_lock.ReleaseLock();
             }
 
             // s3.4.3 retry insert
@@ -472,19 +490,23 @@ class HLSH {
         // s1: caculate hash key value for kv
         uint64_t key_hash = h(p->key(),p->klen());
     RETRY:
-        // s2: find segment  
+        // s2: find segment
         auto seg = GetSegmentWithDirUpdate(key_hash);
         // s3: update kv
         auto r = seg->Update(p, key_hash, pm, thread_id, this);
         // s4: retry if failure to get lock to split
-        if (rSegmentChanged == r) { goto RETRY; }
+        if (rSegmentChanged == r)
+        {
+            goto RETRY;
+        }
 
         return true;
     }
 
     template <class KEY, class VALUE>
     bool HLSH<KEY, VALUE>::UpdateForReclaim(Pair_t<KEY, VALUE> *p,
-                                            PmOffset old_value, PmOffset new_value)
+                                            PmOffset old_value,
+                                            PmOffset new_value)
     {
         // s1: caculate hash key value for kv
         uint64_t key_hash = h(p->key(),p->klen());
@@ -494,8 +516,15 @@ class HLSH {
         // s3: update kv
         auto r = seg->UpdateForReclaim(p, key_hash, old_value, new_value, pm, this);
         // s4: retry if failure to get lock to split
-        if (rSegmentChanged == r) { goto RETRY; }
-
+        if (rSegmentChanged == r)
+        {
+            goto RETRY;
+        }
+        // s: value may be deleted
+        if (rFailure == r)
+        {
+            pm->Delete(new_value);
+        }
         return true;
     }
 
@@ -539,23 +568,18 @@ class HLSH {
         int extra_rcode = 0;
         auto r = seg->Get(p, key_hash, extra_rcode);
         // s4: return value or retry
-        if (rFailure == r) {
-            auto new_seg = GetSegment(key_hash);
-            if (seg != new_seg) {
-                seg = new_seg;
-                goto RETRY;
-            };
-        }
+        auto new_seg = GetSegment(key_hash);
+        if (seg != new_seg)
+        {
+            seg = new_seg;
+            goto RETRY;
+        };
         return r;
     }
 
     /* Delete: By default, the merge operation is disabled*/
     template <class KEY, class VALUE>
     bool HLSH<KEY, VALUE>::Delete(Pair_t<KEY, VALUE>* p, size_t thread_id) {
-        if (count3.fetch_add(1) >= 150000000)
-        {
-            _exit(0);
-        }
         // s1: caclulate the hash value for key-value pair
         uint64_t key_hash = h(p->key(), p->klen());
     RETRY:
@@ -564,10 +588,11 @@ class HLSH {
         // s3: delete kv
         auto r = seg->Delete(p, key_hash, pm, this);
         // s4: retry if failure to get lock to split
-        if (rSegmentChanged == r) {
+        if (rSegmentChanged == r)
+        {
             goto RETRY;
         }
-        
+
         return true;
     }
 }

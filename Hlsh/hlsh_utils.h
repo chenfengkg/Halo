@@ -20,8 +20,8 @@
 namespace HLSH_hashing {
 #define ALIGNED(N) __attribute__((aligned(N)))
 #define PACKED __attribute__((packed))
-#define CHECK_BIT(var, pos) ((((var) & (1 << (pos))) > 0) ? (1) : (0))
-#define CHECK_BITL(var, pos) ((((var) & (1UL << (pos))) > 0) ? (1) : (0))
+#define CHECK_BIT(var, pos) ((var) & (1 << (pos)))
+#define CHECK_BITL(var, pos) ((var) & (1UL << (pos)))
 #define SET_BITL(var, pos) ((var) | (1UL << (pos)))
 #define UNSET_BITL(var, pos) ((var) & (~(1UL << (pos))))
 #define LIKELY(x) __builtin_expect((x), 1)

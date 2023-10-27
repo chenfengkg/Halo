@@ -37,6 +37,9 @@
 #include <stdio.h>
 
 #include <string>
+
+extern std::atomic<uint64_t> soft_write_count;
+
 static inline void clflush(void* p) {
   asm volatile(".byte 0x66; xsaveopt %0" : "+m"(p));
 }

@@ -8,6 +8,7 @@ namespace HLSH_hashing {
     struct Directory;
     template <class KEY, class VALUE>
     struct Segment;
+
     /*meta on DRAM: thread-local*/
     template <class KEY, class VALUE>
     struct alignas(64) ThreadMeta {
@@ -28,6 +29,7 @@ namespace HLSH_hashing {
               chunk->foffset.fo.flag = CHUNK_FLAG::FULL_CHUNK;
               chunk->foffset.fo.offset = offset;
               clwb_sfence(&chunk->foffset, sizeof(FlagOffset));
+              //   hlsh_write_count++;
               return PO_NULL;
           }
           // s2: obtain the insertion address
@@ -380,9 +382,11 @@ namespace HLSH_hashing {
                 for (size_t i = 0; i < kDimmNum; i++)
                 {
                     // s: traverse to get a empyt chunk
-                    chunk = GetNewChunkFromDimm((i + k) % kDimmNum, log_id);
-                    if (chunk)
+                    k = (i + min_dimm) % kDimmNum;
+                    chunk = GetNewChunkFromDimm(k, log_id);
+                    if (chunk){
                         break;
+                    }
                 }
             } while (!chunk);
             {
@@ -391,6 +395,7 @@ namespace HLSH_hashing {
                 {
                     dm[min_dimm].allocated_memory_block--;
                     dm[k].allocated_memory_block++;
+                    min_dimm = k;
                 }
             }
             // s4: set new information for ThreadMeta 
@@ -434,6 +439,7 @@ namespace HLSH_hashing {
             if (PO_NULL == pf) {
                 // s2.1: get new chunk due to old chunk is full
                 auto chunk = GetNewChunk(dimm_no, tid);
+                // hlsh_write_count.fetch_add(3);
                 if (!chunk) {
                     std::cerr << "no enough memory!" << std::endl;
                     exit(1);
