@@ -9,8 +9,9 @@
 #include "VolatileNode.h"
 #include "ssmem.h"
 #include "utilities.h"
-__thread ssmem_allocator_t *alloc;
-__thread ssmem_allocator_t *volatileAlloc;
+#define SOFT_THREAD_NUM 36
+ssmem_allocator_t *alloc[SOFT_THREAD_NUM];
+ssmem_allocator_t *volatileAlloc[SOFT_THREAD_NUM];
 extern VMEM *vmp1;
 #define UNLIKELY(x) __builtin_expect((x), 0)
 #define LIKELY(x) __builtin_expect((x), 1)
@@ -18,27 +19,29 @@ extern VMEM *vmp1;
 #define MFENCE __sync_synchronize
 typedef unsigned char uchar;
 typedef softUtils::state state;
+
+#define DRAM_INDEX
 void init_alloc(int id) {
   auto r = vmem_malloc(vmp1, sizeof(ssmem_allocator_t));
-  alloc = (ssmem_allocator_t *)r;
-  ssmem_alloc_init(alloc, SSMEM_DEFAULT_MEM_SIZE, id, 1);
+  alloc[id] = (ssmem_allocator_t *)r;
+  ssmem_alloc_init(alloc[id], SSMEM_DEFAULT_MEM_SIZE, id, 1);
 }
 void init_volatileAlloc(int id) {
-  volatileAlloc = (ssmem_allocator_t *)malloc(sizeof(ssmem_allocator_t));
-  ssmem_alloc_init(volatileAlloc, SSMEM_DEFAULT_MEM_SIZE, id, 0);
+  volatileAlloc[id] = (ssmem_allocator_t *)malloc(sizeof(ssmem_allocator_t));
+  ssmem_alloc_init(volatileAlloc[id], SSMEM_DEFAULT_MEM_SIZE, id, 0);
 }
 template <class T>
 class SOFTList {
  private:
-  PNode<T> *allocNewPNode() {
-    auto r = static_cast<PNode<T> *>(ssmem_alloc(alloc, sizeof(PNode<T>), 1));
+  PNode<T> *allocNewPNode(int tid) {
+    auto r = static_cast<PNode<T> *>(ssmem_alloc(alloc[tid], sizeof(PNode<T>), 1));
     return r;
   }
 
   Node<T> *allocNewVolatileNode(uintptr_t key, T value, PNode<T> *pptr,
-                                bool pValidity) {
+                                bool pValidity, int tid) {
     Node<T> *n =
-        static_cast<Node<T> *>(ssmem_alloc(volatileAlloc, sizeof(Node<T>), 0));
+        static_cast<Node<T> *>(ssmem_alloc(volatileAlloc[tid], sizeof(Node<T>), 0));
     n->key = key;
     n->value = value;
     n->pptr = pptr;
@@ -55,6 +58,22 @@ class SOFTList {
 #ifdef PM_COUNT
     hash_api::performance.FENCE_count++;
 #endif
+  }
+
+  std::pair<size_t, size_t> get_total_space()
+  {
+    size_t total_node = 1;
+    Node<T> *curr = head->next.load();
+    Node<T> *currRef = softUtils::getRef<Node<T>>(curr);
+    while (currRef->key != ULLONG_MAX)
+    {
+      total_node++;
+      curr = currRef->next.load();
+      currRef = softUtils::getRef<Node<T>>(curr);
+    }
+    auto total_dram = total_node * sizeof(Node<T>);
+    auto total_pmem = total_node * sizeof(PNode<T>);
+    return {total_dram, total_pmem};
   }
 
  private:
@@ -94,7 +113,7 @@ class SOFTList {
   }
 
  public:
-  bool insert(uintptr_t key, T value) {
+  bool insert(uintptr_t key, T value, int tid) {
     {
       // test PM insert performance
       // PNode<T> *newPNode = allocNewPNode();
@@ -116,29 +135,35 @@ class SOFTList {
         resultNode = currRef;
         if (currState != state::INTEND_TO_INSERT) return false;
       } else {
-        PNode<T> *newPNode = allocNewPNode();
-        // PNode<T> *newPNode = nullptr;
-        // soft_write_count++;
+#ifdef DRAM_INDEX
+        PNode<T> *newPNode = nullptr;
+        bool pValid = true;
+#else
+        PNode<T> *newPNode = allocNewPNode(tid);
         bool pValid = newPNode->alloc();
-        // bool pValid = true;
-        Node<T> *newNode = allocNewVolatileNode(key, value, newPNode, pValid);
+#endif
+        // soft_write_count++;
+        Node<T> *newNode = allocNewVolatileNode(key, value, newPNode, pValid, tid);
         newNode->next.store(static_cast<Node<T> *>(softUtils::createRef(
                                 currRef, state::INTEND_TO_INSERT)),
                             std::memory_order_relaxed);
         if (!pred->next.compare_exchange_strong(
                 curr, static_cast<Node<T> *>(
                           softUtils::createRef(newNode, predState)))) {
-          ssmem_free(volatileAlloc, newNode, false);
-          ssmem_free(alloc, newPNode, true);
+          ssmem_free(volatileAlloc[tid], newNode, false);
+#ifndef DRAM_INDEX
+          ssmem_free(alloc[tid], newPNode, true);
+#endif
           goto retry;
         }
         resultNode = newNode;
         result = true;
       }
 
+#ifndef DRAM_INDEX
       resultNode->pptr->create(resultNode->key, resultNode->value,
                                resultNode->pValidity);
-
+#endif
       while (softUtils::getState(resultNode->next.load()) ==
              state::INTEND_TO_INSERT)
         softUtils::stateCAS<Node<T>>(resultNode->next, state::INTEND_TO_INSERT,
@@ -168,8 +193,9 @@ class SOFTList {
            softUtils::getState(currRef->next.load()) == state::INSERTED)
       casResult = softUtils::stateCAS<Node<T>>(currRef->next, state::INSERTED,
                                                state::INTEND_TO_DELETE);
-
+#ifndef DRAM_INDEX
     currRef->pptr->destroy(currRef->pValidity);
+#endif
 
     while (softUtils::getState(currRef->next.load()) == state::INTEND_TO_DELETE)
       softUtils::stateCAS<Node<T>>(currRef->next, state::INTEND_TO_DELETE,
@@ -234,8 +260,8 @@ class SOFTList {
       }
     }
   }
-  void recovery() {
-    auto curr = alloc->mem_chunks;
+  void recovery(int tid) {
+    auto curr = alloc[tid]->mem_chunks;
     for (; curr != nullptr; curr = curr->next) {
       PNode<T> *currChunk = static_cast<PNode<T> *>(curr->obj);
       uint64_t numOfNodes = SSMEM_DEFAULT_MEM_SIZE / sizeof(PNode<T>);
@@ -244,9 +270,9 @@ class SOFTList {
         // if (currNode->key == 0) continue;
         if (!currNode->isValid() || currNode->isDeleted()) {
           currNode->validStart = currNode->validEnd.load();
-          ssmem_free(alloc, currNode, true);
+          ssmem_free(alloc[tid], currNode, true);
         } else
-          quickInsert(currNode);
+          quickInsert(currNode, true);
         // std::cout << currNode->key << std::endl;
       }
     }

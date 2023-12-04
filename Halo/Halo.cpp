@@ -32,6 +32,7 @@ size_t DRAM_MemoryManager::PAGE_ID = 0;
 std::atomic<uint64_t> halo_count{0};
 std::atomic<uint64_t> halo_count1{0};
 std::atomic<uint64_t> halo_count2{0};
+std::atomic<uint64_t> halo_count3{0};
 std::atomic<uint64_t> halo_write_count{0};
 
 // ===========For reclaim=================
@@ -321,6 +322,7 @@ void MemoryManagerPool::shutdown(CLHT *clhts[TABLE_NUM]) {
       pmem_unmap(addr, sz * sizeof(Bucket));
     }));
 
+    halo_count2 += sz;
     // store DPage
     for (auto &&p : dm->pages) {
       auto name2 =
@@ -332,6 +334,7 @@ void MemoryManagerPool::shutdown(CLHT *clhts[TABLE_NUM]) {
         pmem_deep_persist(addr, PAGE_SIZE);
         pmem_unmap(addr, PAGE_SIZE);
       }));
+      halo_count3++;
     }
   }
   for (auto &&i : t) i.join();
@@ -425,6 +428,8 @@ std::vector<size_t> MemoryManagerPool::startup(CLHT *clhts[TABLE_NUM]) {
             }));
 
             clhts[segmend_id] = table;
+
+            halo_count += table_size;
           } else {
             std::filesystem::remove(entry);
           }
@@ -465,6 +470,7 @@ std::vector<size_t> MemoryManagerPool::startup(CLHT *clhts[TABLE_NUM]) {
             memcpy(DPage_table[page_id], addr, PAGE_SIZE);
             pmem_unmap(addr, PAGE_SIZE);
           }));
+          halo_count1++;
         }
       }
     }

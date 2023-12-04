@@ -347,8 +347,9 @@ class CCEH {
   IndexV Get(const KeyType&);
   void Remove(IndexV* offset);
   size_t Capacity(void);
+  size_t GetTotalUsedSpace(void) const;
 
- private:
+private:
   Directory<KeyType>* dir;
   static constexpr bool using_fp_ = requires_fingerprint(KeyType);
 };
@@ -669,6 +670,17 @@ size_t CCEH<KeyType>::Capacity(void) {
     set[dir->_[i]] = true;
   }
   return set.size() * Segment<KeyType>::kNumSlot;
+}
+
+template <typename KeyType>
+size_t CCEH<KeyType>::GetTotalUsedSpace(void) const
+{
+  std::unordered_map<Segment<KeyType>*, bool> set;
+  for (size_t i = 0; i < dir->capacity; ++i) {
+    set[dir->_[i]] = true;
+  }
+  return sizeof(CCEH<KeyType>) + set.size() * sizeof(Segment<KeyType>) +
+         sizeof(Directory<KeyType>) + sizeof(Segment<KeyType> *) * dir->capacity;
 }
 
 template <typename KeyType>

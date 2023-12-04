@@ -9,6 +9,9 @@ namespace HLSH_hashing {
     template <class KEY, class VALUE>
     struct Segment;
 
+    extern std::atomic<uint64_t> count;
+    extern std::atomic<uint64_t> count1;
+
     /*meta on DRAM: thread-local*/
     template <class KEY, class VALUE>
     struct alignas(64) ThreadMeta {
@@ -25,7 +28,7 @@ namespace HLSH_hashing {
           if (kChunkSize < (len + offset + sizeof(uint8_t)))
           {
               // s: flush chunk metadata
-              auto chunk = reinterpret_cast<PmChunk<KEY, VALUE> *>(start_addr);
+              auto chunk = GETP_CHUNK_ADDR(start_addr);
               chunk->foffset.fo.flag = CHUNK_FLAG::FULL_CHUNK;
               chunk->foffset.fo.offset = offset;
               clwb_sfence(&chunk->foffset, sizeof(FlagOffset));
@@ -33,7 +36,7 @@ namespace HLSH_hashing {
               return PO_NULL;
           }
           // s2: obtain the insertion address
-          p->store_persist(reinterpret_cast<char*>(start_addr + offset));
+          p->store_persist(GETP_CHAR(start_addr + offset));
           // s3: construct PM offset
           PmOffset of(chunk_addr, offset);
           // s4: increase offset (not flush)
@@ -88,14 +91,14 @@ namespace HLSH_hashing {
 
         size_t GetDepth() {
             // s1: get pointer of the first chunk list head
-            auto chunk = reinterpret_cast<PmChunkList<KEY, VALUE> *>(pmem_start_addr);
+            auto chunk = GETP_CHUNKLIST_ADDR(pmem_start_addr);
             // s2: return depth
             return chunk->depth;
         }
 
         void SetDepth(size_t _depth) {
             // s1: get pointer of the first chunk list head
-            auto chunk = reinterpret_cast<PmChunkList<KEY, VALUE> *>(pmem_start_addr);
+            auto chunk = GETP_CHUNKLIST_ADDR(pmem_start_addr);
             // s2: update and persist depth
             chunk->depth = _depth;
             clwb_sfence(&chunk->depth, sizeof(uint64_t));
@@ -137,6 +140,16 @@ namespace HLSH_hashing {
                 // s: recover crash during allocate
                 chunk_list->RecoverReclaim();
             }
+        }
+
+        inline size_t GetTotalUsedChunk(){
+            size_t used_chunk = 0;
+            for (size_t i = 0; i < kListNum; i++)
+            {
+                auto chunk_list = GetList(i);
+                used_chunk += chunk_list->used_chunk;
+            }
+            return used_chunk;
         }
 
         inline void RecoveryInsertMetadata()
@@ -190,15 +203,14 @@ namespace HLSH_hashing {
             }
             close(fd);
             // s: set pmem_start_addr
-            pmem_start_addr = reinterpret_cast<uint64_t>(pmem_addr);
+            pmem_start_addr = GET_UINT64(pmem_addr);
             // s: using multiple thread to intialize each chunk list information
             std::vector<std::thread> vt;
             auto stripe_num = pool_size / kStripeSize;
             for (size_t i = 0; i < kListNum; i++)
             {
                 auto list_start_addr = pmem_start_addr + kChunkSize * i;
-                auto list = reinterpret_cast<PmChunkList<KEY, VALUE> *>(
-                    pmem_start_addr + kChunkSize * i);
+                auto list = GETP_CHUNKLIST_ADDR(pmem_start_addr + kChunkSize * i);
                 vt.push_back(std::thread(&PmChunkList<KEY, VALUE>::Create, list, kChunkSize * i,
                                          i, stripe_num, index));
             }
@@ -227,12 +239,11 @@ namespace HLSH_hashing {
             }
             close(fd);
             // s: set pmem addr as global variable
-            pmem_start_addr = reinterpret_cast<uint64_t>(pmem_addr);
+            pmem_start_addr = GET_UINT64(pmem_addr);
             // s3: intial each chunk list information
             for (size_t i = 0; i < kListNum; i++)
             {
-                auto list = reinterpret_cast<PmChunkList<KEY, VALUE> *>(
-                    pmem_start_addr + kChunkSize * i);
+                auto list = GETP_CHUNKLIST_ADDR(pmem_start_addr + kChunkSize * i);
                 list->Open(kChunkSize * i, index);
                 clwb_sfence(list, sizeof(PmChunkList<KEY, VALUE>)); // persist
             }
@@ -319,14 +330,13 @@ namespace HLSH_hashing {
             clwb_sfence(&index->Persisted, sizeof(bool));
             printf("finish persisting dram index\n");
         }
+
         inline PmChunk<KEY,VALUE>* GetChunk(size_t chunk_addr){
-            return reinterpret_cast<PmChunk<KEY, VALUE> *>(
-                pmem_start_addr + chunk_addr);
+            return GETP_CHUNK(chunk_addr);
         }
 
         inline PmChunkList<KEY,VALUE>* GetList(size_t list_id){
-            return reinterpret_cast<PmChunkList<KEY, VALUE> *>(
-                pmem_start_addr + kChunkSize * list_id);
+            return GETP_CHUNKLIST_ADDR(pmem_start_addr + kChunkSize * list_id);
         }
 
         PmChunk<KEY, VALUE> *GetNewChunkFromDimm(size_t dimm_id,
@@ -339,7 +349,7 @@ namespace HLSH_hashing {
             // s2: get a new chunk by traversing all chunk list in the dimm
             for (size_t i = 0; i < kChunkNumPerDimm; i++)
             {
-                auto list = reinterpret_cast<PmChunkList<KEY, VALUE> *>(dimm_addr + i * kChunkSize);
+                auto list = GETP_CHUNKLIST_ADDR(dimm_addr + i * kChunkSize);
                 // s: lock for each chunk list
                 new_chunk = list->GetNewChunk();
                 if (new_chunk)
@@ -398,8 +408,8 @@ namespace HLSH_hashing {
                     min_dimm = k;
                 }
             }
-            // s4: set new information for ThreadMeta 
-            tm[tid].start_addr = reinterpret_cast<uint64_t>(chunk);
+            // s4: set new information for ThreadMeta
+            tm[tid].start_addr = GET_UINT64(chunk);
             tm[tid].chunk_addr = chunk->chunk_addr;
             tm[tid].offset = chunk->foffset.fo.offset;
             tm[tid].dimm_no = min_dimm;
@@ -452,28 +462,36 @@ namespace HLSH_hashing {
         inline PmOffset Update(Pair_t<KEY, VALUE> *p, size_t tid, PmOffset po)
         {
             // s1: insert new key-value with higher version into the pm
-            auto op = reinterpret_cast<Pair_t<KEY, VALUE> *>(po.GetValue());
-            p->set_version(op->get_version() + 1);
-            auto pf = Insert(p, tid);
-            // s2: remove old key-value
-            op->set_flag(FLAG_t::INVALID);
-            clwb_sfence(reinterpret_cast<char *>(op), sizeof(FVERSION));
-            // s3: free space for old key-value
-            auto chunk = reinterpret_cast<PmChunk<KEY, VALUE> *>(po.GetChunk());
-            uint64_t len = op->size();
-            chunk->free_size += len;
-            clwb_sfence(&chunk->free_size, sizeof(uint64_t));
-            return pf;
+            auto op = GETP_PAIR(po.GetValue());
+            if constexpr (sizeof(VALUE) > 8)
+            {
+                p->set_version(op->get_version() + 1);
+                auto pf = Insert(p, tid);
+                // s2: remove old key-value
+                op->set_flag(FLAG_t::INVALID);
+                clwb_sfence(GETP_CHAR(op), sizeof(FVERSION));
+                // s3: free space for old key-value
+                auto chunk = GETP_CHUNK_ADDR(po.GetChunk());
+                uint64_t len = op->size();
+                chunk->free_size += len;
+                clwb_sfence(&chunk->free_size, sizeof(uint64_t));
+                return pf;
+            }
+            else
+            {
+                op->update(p);
+                return po;
+            }
         }
 
         /*Delete kv pair*/
         inline void Delete(PmOffset po) {
             // s1: invalid and persist flag
-            auto p = reinterpret_cast<Pair_t<KEY, VALUE>*>(po.GetValue());
+            auto p = GETP_PAIR(po.GetValue());
             p->set_flag(FLAG_t::INVALID);
-            clwb_sfence(reinterpret_cast<char *>(p), sizeof(FVERSION));
+            clwb_sfence(GETP_CHAR(p), sizeof(FVERSION));
             // s2: increase and persist free size
-            auto chunk = reinterpret_cast<PmChunk<KEY, VALUE> *>(po.GetChunk());
+            auto chunk = GETP_CHUNK_ADDR(po.GetChunk());
             chunk->free_size += p->size();
             clwb_sfence(&chunk->free_size, sizeof(uint64_t));
         }

@@ -92,6 +92,7 @@ inline bool var_compare(char *str1, char *str2, int len1, int len2) {
 }
 
 static std::atomic<uint64_t> dash_write_count{0};
+static std::atomic<uint64_t> dash_write_count1{0};
 
 template <class T>
 struct Bucket {
@@ -382,7 +383,6 @@ struct Bucket {
     _[slot].value = value;
     _[slot].key = key;
 #ifdef PMEM
-    dash_write_count++;
     Allocator::Persist(&_[slot], sizeof(_[slot]));
 #endif
     set_hash(slot, meta_hash, probe);
@@ -757,7 +757,6 @@ struct Table {
       next_neighbor->release_lock();
 #ifdef PMEM
       Allocator::Persist(&next_neighbor->bitmap, sizeof(next_neighbor->bitmap));
-      dash_write_count++;
 #endif
       neighbor->unset_hash(displace_index);
       neighbor->Insert_displace(key, value, meta_hash, displace_index, true);
@@ -765,6 +764,7 @@ struct Table {
 #ifdef PMEM
       Allocator::Persist(&neighbor->bitmap, sizeof(neighbor->bitmap));
 #endif
+      // dash_write_count += 4;
       target->release_lock();
 #ifdef COUNTING
       __sync_fetch_and_add(&number, 1);
@@ -786,7 +786,6 @@ struct Table {
       prev_neighbor->release_lock();
 #ifdef PMEM
       Allocator::Persist(&prev_neighbor->bitmap, sizeof(prev_neighbor->bitmap));
-      dash_write_count++;
 #endif
       target->unset_hash(displace_index);
       target->Insert_displace(key, value, meta_hash, displace_index, false);
@@ -794,6 +793,7 @@ struct Table {
 #ifdef PMEM
       Allocator::Persist(&target->bitmap, sizeof(target->bitmap));
 #endif
+      // dash_write_count += 4;
       neighbor->release_lock();
 #ifdef COUNTING
       __sync_fetch_and_add(&number, 1);
@@ -817,6 +817,7 @@ struct Table {
 #ifdef COUNTING
         __sync_fetch_and_add(&number, 1);
 #endif
+        // dash_write_count += 3;
         return 0;
       }
     }
@@ -987,7 +988,7 @@ RETRY:
     target->release_lock();
 #ifdef PMEM
     Allocator::Persist(&target->bitmap, sizeof(target->bitmap));
-    dash_write_count++;
+    // dash_write_count+=2;
 #endif
     neighbor->release_lock();
   } else {
@@ -995,7 +996,7 @@ RETRY:
     neighbor->release_lock();
 #ifdef PMEM
     Allocator::Persist(&neighbor->bitmap, sizeof(neighbor->bitmap));
-    dash_write_count++;
+    // dash_write_count+=2;
 #endif
     target->release_lock();
   }
@@ -1324,7 +1325,7 @@ Table<T> *Table<T>::Split(size_t _key_hash) {
 
   next_table->state = -2;
   Allocator::Persist(&next_table->state, sizeof(next_table->state));
-  dash_write_count += 2;
+  // dash_write_count1 += 2;
   next_table->bucket
       ->get_lock(); /* get the first lock of the new bucket to avoid it
                  is operated(split or merge) by other threads*/
@@ -1353,7 +1354,7 @@ Table<T> *Table<T>::Split(size_t _key_hash) {
 #ifdef COUNTING
           number--;
 #endif
-          dash_write_count++;
+          // dash_write_count1++;
         }
       }
     }
@@ -1387,7 +1388,7 @@ Table<T> *Table<T>::Split(size_t _key_hash) {
 #ifdef COUNTING
           number--;
 #endif
-          dash_write_count++;
+          // dash_write_count1++;
         }
       }
     }
@@ -1397,7 +1398,7 @@ Table<T> *Table<T>::Split(size_t _key_hash) {
   Allocator::Persist(&next_table->pattern, sizeof(next_table->pattern));
   pattern = old_pattern;
   Allocator::Persist(&pattern, sizeof(pattern));
-  dash_write_count += 2;
+  // dash_write_count1 += 2;
 #ifdef PMEM
   Allocator::Persist(next_table, sizeof(Table));
   size_t sumBucket = kNumBucket + stashBucket;
@@ -1410,7 +1411,7 @@ Table<T> *Table<T>::Split(size_t _key_hash) {
   }
 
   Allocator::Persist(this, sizeof(Table));
-  dash_write_count += sumBucket;
+  // dash_write_count1 += sumBucket;
 #endif
   return next_table;
 }
@@ -1524,6 +1525,22 @@ class Finger_EH {
     clean = true;
     Allocator::Persist(&clean, sizeof(clean));
   }
+
+  std::pair<size_t,size_t> Space_Consumption(){
+    Table<T> **dir_entry = dir->_;
+    auto ss = reinterpret_cast<Table<T> *>(
+        reinterpret_cast<uint64_t>(dir_entry[0]) & tailMask);
+    uint64_t seg_count = 1;
+    while (!OID_IS_NULL(ss->next)) {
+      seg_count++;
+      ss = reinterpret_cast<Table<T> *>(pmemobj_direct(ss->next));
+    }
+    int capacity = pow(2, dir->global_depth);
+    size_t total_pmem = sizeof(Finger_EH<T>) + seg_count * sizeof(Table<T>) +
+                        sizeof(Directory<T>) + sizeof(Table<T> *) * capacity;
+    return {0, total_pmem};
+  }
+
   void getNumber() {
     std::cout << "The size of the bucket is " << sizeof(struct Bucket<T>)
               << std::endl;
@@ -1649,7 +1666,8 @@ Finger_EH<T>::Finger_EH() {
 template <class T>
 Finger_EH<T>::~Finger_EH(void) {
   // TO-DO
-  printf("extra_write_count: %lu\n", dash_write_count.load());
+  printf("extra_write, count: %lu, count1: %lu, total_count: %lu\n",
+         dash_write_count.load(), dash_write_count1.load(), dash_write_count.load() + dash_write_count1.load());
 }
 
 template <class T>
@@ -2007,7 +2025,7 @@ RETRY:
     Allocator::Persist(&new_b->state, sizeof(int));
     target->state = 0;
     Allocator::Persist(&target->state, sizeof(int));
-    dash_write_count += 2;
+    // dash_write_count += 2;
 
     Bucket<T> *curr_bucket;
     for (int i = 0; i < kNumBucket; ++i) {

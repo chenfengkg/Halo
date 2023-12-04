@@ -3,6 +3,8 @@
 namespace HLSH_hashing
 {
   using FVERSION = uint8_t;
+  #define PAIR_VALUE_LEN 512
+  #define PAIR_KEY_LEN 8
   constexpr uint8_t kInvalidPair = 0xC0;
   constexpr uint8_t kFlagBits = 2;
   constexpr uint8_t kFlagMask = (1 << kFlagBits) - 1;
@@ -63,17 +65,25 @@ namespace HLSH_hashing
       return (FVERSION_GET_FLAG(fv) == FLAG_t::END);
     }
 
-    inline void load(char *p)
+    inline bool cmp_key(Pair_t<KEY, VALUE> *other)
     {
-      auto pt = reinterpret_cast<Pair_t<KEY, VALUE> *>(p);
-      *this = *pt;
+      return _key == other->_key;
     }
 
-    KEY *key() { return &_key; }
-    KEY str_key() { return _key; }
-    VALUE value() { return _value; }
-    size_t klen() { return sizeof(KEY); }
-    void set_key(KEY k) { _key = k; }
+    inline bool cmp_key_and_load(Pair_t<KEY, VALUE> *other)
+    {
+      if (_key == other->_key)
+      {
+        other->_value = _value;
+        return true;
+      }
+      return false;
+    }
+
+    inline KEY *key() { return &_key; }
+    inline size_t klen() { return sizeof(KEY); }
+
+    inline void set_key(KEY k) { _key = k; }
 
     inline void store_persist(char *addr)
     {
@@ -93,6 +103,12 @@ namespace HLSH_hashing
     {
       auto p = reinterpret_cast<char *>(this);
       memcpy(addr, p, size());
+    }
+
+    inline void update(Pair_t<KEY, VALUE> *p)
+    {
+      _value = p->_value;
+      clwb_sfence(&_value, sizeof(VALUE));
     }
 
     void set_empty()
@@ -140,31 +156,11 @@ namespace HLSH_hashing
     FVERSION fv;
     KEY _key;
     uint32_t _vlen;
-    std::string svalue;
+    char svalue[PAIR_VALUE_LEN];
 
-    Pair_t()
-    {
+    Pair_t<KEY,std::string>(){
       fv = 0;
       _vlen = 0;
-      svalue.reserve(MAX_VALUE_LEN);
-    };
-
-    Pair_t(char *p)
-    {
-      auto pt = reinterpret_cast<Pair_t *>(p);
-      fv = pt->fv;
-      _key = pt->_key;
-      _vlen = pt->_vlen;
-      svalue.assign(p + sizeof(KEY) + sizeof(uint32_t) + sizeof(FVERSION), _vlen);
-    }
-
-    void load(char *p)
-    {
-      auto pt = reinterpret_cast<Pair_t *>(p);
-      fv = pt->fv;
-      _key = pt->_key;
-      _vlen = pt->_vlen;
-      svalue.assign(p + sizeof(KEY) + sizeof(uint32_t) + sizeof(FVERSION), _vlen);
     }
 
     inline bool IsValid()
@@ -177,15 +173,29 @@ namespace HLSH_hashing
       return (FVERSION_GET_FLAG(fv) == FLAG_t::END);
     }
 
+    inline bool cmp_key(Pair_t<KEY, std::string> *other)
+    {
+      return other->_key == _key;
+    }
+
+    inline bool cmp_key_and_load(Pair_t<KEY, std::string> *other)
+    {
+      if (other->_key == _key)
+      {
+        other->_vlen = _vlen;
+        memcpy(other->svalue, svalue, _vlen);
+        return true;
+      }
+      return false;
+    }
+
     size_t klen() { return sizeof(KEY); }
     KEY *key() { return &_key; }
-    KEY str_key() { return _key; }
-    std::string str_value() { return svalue; }
 
     Pair_t(KEY k, char *v_ptr, size_t vlen) : _vlen(vlen), _key(k)
     {
       FVERSION_SET_VERSION(fv, 0);
-      svalue.assign(v_ptr, _vlen);
+      memcpy(svalue, v_ptr, vlen);
     }
 
     void set_key(KEY k) { _key = k; }
@@ -210,21 +220,27 @@ namespace HLSH_hashing
       memcpy(addr, p, size());
     }
 
-    void set_empty() { _vlen = 0; }
-    void set_version(FVERSION version)
+    inline bool update(Pair_t<KEY, std::string> *p)
+    {
+      return false;
+    }
+
+    inline void set_empty() { _vlen = 0; }
+    inline void set_version(FVERSION version)
     {
       FVERSION_SET_VERSION(fv, version);
     }
-    FVERSION get_version() { return FVERSION_GET_VERSION(fv); }
-    void set_flag(FVERSION f)
+    inline FVERSION get_version() { return FVERSION_GET_VERSION(fv); }
+    inline void set_flag(FVERSION f)
     {
       FVERSION_SET_FLAG(fv, f);
     }
-    FLAG_t get_flag()
+    inline FLAG_t get_flag()
     {
       return FVERSION_GET_FLAG(fv);
     }
-    void set_flag_persist(FVERSION f)
+
+    inline void set_flag_persist(FVERSION f)
     {
       FVERSION_SET_FLAG(fv, f);
       clwb_sfence(reinterpret_cast<char *>(this), 8);
@@ -242,16 +258,15 @@ namespace HLSH_hashing
     FVERSION fv;
     uint32_t _klen;
     uint32_t _vlen;
-    std::string skey;
-    std::string svalue;
+    char svalue[PAIR_KEY_LEN + PAIR_VALUE_LEN];
+
     Pair_t()
     {
       fv = 0;
       _klen = 0;
       _vlen = 0;
-      skey.reserve(MAX_KEY_LEN);
-      svalue.reserve(MAX_VALUE_LEN);
     };
+
     Pair_t(char *p)
     {
       auto pt = reinterpret_cast<Pair_t *>(p);
@@ -259,8 +274,7 @@ namespace HLSH_hashing
       _klen = pt->_klen;
       _vlen = pt->_vlen;
       auto len = sizeof(FVERSION) + sizeof(uint32_t) + sizeof(uint32_t);
-      skey.assign(p + len, _klen);
-      svalue.assign(p + len + _klen, _vlen);
+      memcpy(svalue, p + len, _klen + _vlen);
     }
 
     inline bool IsValid()
@@ -273,32 +287,38 @@ namespace HLSH_hashing
       return (FVERSION_GET_FLAG(fv) == FLAG_t::END);
     }
 
-    inline void load(char *p)
+    inline bool cmp_key(Pair_t<std::string, std::string> *other)
     {
-      auto pt = reinterpret_cast<Pair_t *>(p);
-      fv = pt->fv;
-      _klen = pt->_klen;
-      _vlen = pt->_vlen;
-      auto len = sizeof(FVERSION) + sizeof(uint32_t) + sizeof(uint32_t);
-      skey.assign(p + len, _klen);
-      svalue.assign(p + len + _klen, _vlen);
+      return (_klen == other->_klen) && (!std::strncmp(svalue, other->svalue, _klen));
     }
+
+    inline bool cmp_key_and_load(Pair_t<std::string, std::string> *other)
+    {
+      if (_klen == other->_klen &&
+          (!std::strncmp(svalue, other->svalue, _klen)))
+      {
+        other->_vlen = _vlen;
+        memcpy(other->svalue + _klen, svalue + _klen, _vlen);
+        return true;
+      }
+      return false;
+    }
+
     size_t klen() { return _klen; }
-    char *key() { return &skey[0]; }
-    std::string str_key() { return skey; }
-    std::string value() { return svalue; }
+    char *key() { return svalue; }
 
     Pair_t(char *k_ptr, size_t klen, char *v_ptr, size_t vlen)
         : _klen(klen), _vlen(vlen)
     {
       FVERSION_SET_VERSION(fv,0);
-      skey.assign(k_ptr, _klen);
-      svalue.assign(v_ptr, _vlen);
+      memcpy(svalue, k_ptr, _klen);
+      memcpy(svalue + _klen, v_ptr, _vlen);
     }
+
     void set_key(char *k_ptr, size_t kl)
     {
       _klen = kl;
-      skey.assign(k_ptr, _klen);
+      memcpy(svalue, k_ptr, _klen);
     }
 
     void store_persist(char *addr)
@@ -306,8 +326,7 @@ namespace HLSH_hashing
       auto p = reinterpret_cast<char *>(this);
       auto len = sizeof(uint32_t) + sizeof(uint32_t);
       memcpy(addr + sizeof(FVERSION), p, len);
-      memcpy(addr + sizeof(FVERSION) + len, &skey[0], _klen);
-      memcpy(addr + sizeof(FVERSION) + len + _klen, &svalue[0], _vlen);
+      memcpy(addr + sizeof(FVERSION) + len, svalue, _klen + _vlen);
       // s: set next pair flag as invalid
       *(reinterpret_cast<uint8_t *>(addr + sizeof(FVERSION) + len + _klen + _vlen)) = kInvalidPair;
       // s: barrier
@@ -322,15 +341,25 @@ namespace HLSH_hashing
       memcpy(addr, p, size());
     }
 
+    inline bool update(Pair_t<std::string, std::string> *p)
+    {
+      return false;
+    }
+
     void set_empty()
     {
       _klen = 0;
       _vlen = 0;
     }
+
     void set_version(FVERSION version) { FVERSION_SET_VERSION(fv, version); }
+
     FVERSION get_version() { return FVERSION_GET_VERSION(fv); }
+
     void set_flag(FVERSION f) { FVERSION_SET_FLAG(fv, f); }
+
     FVERSION get_flag() { return FVERSION_GET_FLAG(fv); }
+
     void set_flag_persist(FVERSION f)
     {
       FVERSION_SET_FLAG(fv,f);

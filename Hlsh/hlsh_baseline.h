@@ -56,6 +56,20 @@ class HLSH {
     return seg_count * Segment<KEY,VALUE>::GetSlotNum();
   }
 
+  std::pair<size_t, size_t> SpaceConsumption()
+  {
+      std::unordered_map<Segment<KEY, VALUE> *, bool> set;
+      for (size_t i = 0; i < dir->capacity; i++)
+      {
+          set[dir->_[i]] = true;
+      }
+      size_t total_dram = (set.size() + remaining_chunk) * sizeof(Segment<KEY, VALUE>) +
+                          sizeof(Directory<KEY, VALUE>) +
+                          dir->capacity * sizeof(Segment<KEY, VALUE> *);
+      size_t total_pmem = (pm->GetTotalUsedChunk() + kDimmNum) * kChunkSize;
+      return {total_dram, total_pmem};
+  }
+
   inline Segment<KEY,VALUE>* GetSegment(size_t key_hash) {
     // s1: get segment pointer from lastest dir
     auto d = LOAD(&dir);
@@ -128,9 +142,6 @@ class HLSH {
     {
         bool is_recovery = false;
         std::cout << "Reinitialize up" << std::endl;
-        struct timespec start, end;
-        clock_gettime(CLOCK_MONOTONIC, &start);
-
         // s2: recovery from shutdown file
         auto shutdown_file_name = PM_PATH + std::string("HLSH_SHUTDOWN");
         if (FileExists(shutdown_file_name.c_str()))
@@ -261,20 +272,13 @@ class HLSH {
             // s: recovery from start
             pm->RecoveryWithData();
         }
-
-        clock_gettime(CLOCK_MONOTONIC, &end);
-        size_t elapsed = static_cast<size_t>((end.tv_sec - start.tv_sec) * 1000000000 + (end.tv_nsec - start.tv_nsec));
-        float elapsed_sec = elapsed / 1000000000.0;
-        printf("recovery time(LEH): %f s\n", elapsed_sec);
     }
 
     template <class KEY, class VALUE>
     HLSH<KEY, VALUE>::~HLSH(void) {
         // s: persist dram index
-        // pm->Shutdown(dir);
-        size_t total_usage =  sizeof(PmManage<KEY, VALUE>) + sizeof(HLSH<KEY, VALUE>);
-        float tu = total_usage;
-        printf("HLSH DRAM total_Usage: %fB, %fKB, %fMB, %fGB\n", tu, tu / (1024.0), tu / (1024.0 * 1024.0), tu / (1024.0 * 1024.0 * 1024.0));
+        pm->Shutdown(dir);
+
         printf("count: %lu, count1: %lu, count2: %lu, total: %lu\n",
                count.load(), count1.load(), count2.load(), count.load() + count1.load() + count2.load());
         printf("count3: %lu, count4: %lu, count5: %lu, total: %lu\n",
@@ -412,10 +416,12 @@ class HLSH {
         // pm->Insert(p, thread_id);
         // return true;
         // s1: insert kv-pair to pm except recovery
+#ifndef DRAM_INDEX
         if (!is_recovery)
         {
             tl_value.InitValue();
         }
+#endif
         // s2: caculate hash value for key-value pair
         uint64_t key_hash = h(p->key(), p->klen());
 
@@ -532,33 +538,6 @@ class HLSH {
     template <class KEY, class VALUE>
     bool HLSH<KEY, VALUE>::Get(Pair_t<KEY, VALUE> *p)
     {
-        // GetNum++;
-        // if (!(GetNum % PrefetchNum))
-        // {
-        //     for (size_t i = 0; i < PrefetchNum; i++)
-        //     {
-        //         if (pv[i].ok != nullptr)
-        //         {
-        // auto prep = reinterpret_cast<Pair_t<KEY, VALUE> *>(pv[i].ok);
-        // for (auto kp : pv[i].kp)
-        // {
-        //     auto t = reinterpret_cast<Pair_t<KEY, VALUE> *>(kp);
-        //     if (prep->str_key() == t->str_key())
-        //     {
-        //         prep->load(kp);
-        //         auto tmp = __atomic_load_n(&t->fv.pad, __ATOMIC_ACQUIRE);
-        //         FlagVersion fv(tmp);
-        //         if (fv.get_flag() == FLAG_t::VALID)
-        //         {
-        //             break;
-        //         }
-        //     }
-        // }
-        //             pv[i].Clear();
-        //         }
-        //     }
-        //     GetNum = 0;
-        // }
         // s1: caculate hash value for key-value pair
         uint64_t key_hash = h(p->key(), p->klen());
         // s2: obtain segment
@@ -574,6 +553,20 @@ class HLSH {
             seg = new_seg;
             goto RETRY;
         };
+#ifdef READ_BUFFER
+        RBUFFER[GetNum] = GETP_CHAR(p);
+        GetNum++;
+        if (GetNum == PrefetchNum)
+        {
+            for (size_t i = 0; i < PrefetchNum; i++)
+            {
+                auto cache_p = GETP_PAIR(RBUFFER[i]);
+                auto pm_pair = GETP_PAIR(RADDRS[i]);
+                pm_pair->cmp_key_and_load(cache_p);
+            }
+            GetNum = 0;
+        }
+#endif
         return r;
     }
 

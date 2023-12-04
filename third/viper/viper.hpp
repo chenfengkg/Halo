@@ -69,6 +69,7 @@ static constexpr auto VIPER_MAP_FLAGS = MAP_SHARED_VALIDATE | MAP_SYNC;
 static constexpr auto VIPER_DRAM_MAP_FLAGS = MAP_ANONYMOUS | MAP_PRIVATE;
 static constexpr auto VIPER_FILE_OPEN_FLAGS = O_CREAT | O_RDWR | O_DIRECT;
 
+#define DRAM_INDEX
 struct ViperConfig {
   double resize_threshold = 0.85;
   double reclaim_free_percentage = 0.4;
@@ -363,13 +364,14 @@ class Viper {
 
   void reclaim();
 
+  std::pair<size_t, size_t> space_consumption() const;
+  size_t get_total_allocated_pmem() const;
+
   class ReadOnlyClient {
     friend class Viper<K, V>;
 
    public:
     bool get(const K& key, V* value) const;
-    size_t get_total_used_pmem() const;
-    size_t get_total_allocated_pmem() const;
 
    protected:
     explicit ReadOnlyClient(ViperT& viper);
@@ -1124,23 +1126,25 @@ template <typename K, typename V>
 bool Viper<K, V>::Client::put(const K& key, const V& value,
                               const bool delete_old) {
   {
+#ifdef DRAM_INDEX
     // test CCEH
-    // const KVOffset kv_offset{0, 0, 0};
-    // KVOffset old_offset;
+    const KVOffset kv_offset{0, 0, 0};
+    KVOffset old_offset;
 
-    // if constexpr (using_fp)
-    // {
-    //   auto key_check_fn = [&](auto key, auto offset)
-    //   {
-    //     return this->viper_.check_key_equality(key, offset);
-    //   };
-    //   old_offset = this->viper_.map_.Insert(key, kv_offset, key_check_fn);
-    // }
-    // else
-    // {
-    //   old_offset = this->viper_.map_.Insert(key, kv_offset);
-    // }
-    // return true;
+    if constexpr (using_fp)
+    {
+      auto key_check_fn = [&](auto key, auto offset)
+      {
+        return this->viper_.check_key_equality(key, offset);
+      };
+      old_offset = this->viper_.map_.Insert(key, kv_offset, key_check_fn);
+    }
+    else
+    {
+      old_offset = this->viper_.map_.Insert(key, kv_offset);
+    }
+    return true;
+#endif
   }
   v_page_->lock();
 
@@ -1319,6 +1323,29 @@ bool Viper<K, V>::Client::put(const K& key, const V& value) {
  */
 template <typename K, typename V>
 bool Viper<K, V>::Client::get(const K& key, V* value) {
+  {
+#ifdef DRAM_INDEX
+    // test cceh
+    auto key_check_fn = [&](auto key, auto offset)
+    {
+      if constexpr (using_fp)
+      {
+        return this->viper_.check_key_equality(key, offset);
+      }
+      else
+      {
+        return cceh::CCEH<K>::dummy_key_check(key, offset);
+      }
+    };
+
+    KVOffset kv_offset = this->viper_.map_.Get(key, key_check_fn);
+    if (kv_offset.is_tombstone())
+    {
+      return false;
+    }
+    return true;
+#endif
+  }
   auto key_check_fn = [&](auto key, auto offset) {
     if constexpr (using_fp) {
       return this->viper_.check_key_equality(key, offset);
@@ -1348,25 +1375,27 @@ bool Viper<K, V>::Client::get(const K& key, V* value) {
 template <typename K, typename V>
 bool Viper<K, V>::ReadOnlyClient::get(const K& key, V* value) const {
   {
+#ifdef DRAM_INDEX
     // test cceh
-    // auto key_check_fn = [&](auto key, auto offset)
-    // {
-    //   if constexpr (using_fp)
-    //   {
-    //     return this->viper_.check_key_equality(key, offset);
-    //   }
-    //   else
-    //   {
-    //     return cceh::CCEH<K>::dummy_key_check(key, offset);
-    //   }
-    // };
+    auto key_check_fn = [&](auto key, auto offset)
+    {
+      if constexpr (using_fp)
+      {
+        return this->viper_.check_key_equality(key, offset);
+      }
+      else
+      {
+        return cceh::CCEH<K>::dummy_key_check(key, offset);
+      }
+    };
 
-    // KVOffset kv_offset = this->viper_.map_.Get(key, key_check_fn);
-    // if (kv_offset.is_tombstone())
-    // {
-    //   return false;
-    // }
-    // return true;
+    KVOffset kv_offset = this->viper_.map_.Get(key, key_check_fn);
+    if (kv_offset.is_tombstone())
+    {
+      return false;
+    }
+    return true;
+#endif
   }
   auto key_check_fn = [&](auto key, auto offset) {
     if constexpr (using_fp) {
@@ -1449,6 +1478,28 @@ bool Viper<K, V>::Client::update(const K& key, UpdateFn update_fn) {
  */
 template <typename K, typename V>
 bool Viper<K, V>::Client::remove(const K& key) {
+  {
+#ifdef DRAM_INDEX
+    auto key_check_fn = [&](auto key, auto offset)
+    {
+      if constexpr (using_fp)
+      {
+        return this->viper_.check_key_equality(key, offset);
+      }
+      else
+      {
+        return cceh::CCEH<K>::dummy_key_check(key, offset);
+      }
+    };
+
+    KVOffset kv_offset = this->viper_.map_.Get(key, key_check_fn);
+    if (kv_offset.is_tombstone())
+    {
+      return false;
+    }
+    this->viper_.map_.Remove(&kv_offset);
+#endif
+  }
   auto key_check_fn = [&](auto key, auto offset) {
     if constexpr (using_fp) {
       return this->viper_.check_key_equality(key, offset);
@@ -1731,17 +1782,21 @@ inline bool Viper<K, V>::ReadOnlyClient::get_const_value_from_offset(
 
 /** Return the total number of used bytes in PMem */
 template <typename K, typename V>
-size_t Viper<K, V>::ReadOnlyClient::get_total_used_pmem() const {
+std::pair<size_t, size_t> Viper<K, V>::space_consumption() const
+{
+  size_t total_dram = map_.GetTotalUsedSpace();
   // + PAGE_SIZE for metadata block
-  return (this->viper_.v_base_.v_metadata->num_used_blocks *
-          sizeof(VPageBlock)) +
-         PAGE_SIZE;
+  size_t total_pmem = (v_base_.v_metadata->num_used_blocks *
+                       sizeof(VPageBlock)) +
+                      PAGE_SIZE;
+  return {total_dram,total_pmem};
 }
 
 /** Return the total number of allocated bytes in PMem */
 template <typename K, typename V>
-size_t Viper<K, V>::ReadOnlyClient::get_total_allocated_pmem() const {
-  return this->viper_.v_base_.v_metadata->total_mapped_size;
+size_t Viper<K, V>::get_total_allocated_pmem() const
+{
+  return v_base_.v_metadata->total_mapped_size;
 }
 
 template <typename K, typename V>
@@ -1754,7 +1809,14 @@ inline bool Viper<K, V>::Client::get_value_from_offset(const KVOffset offset,
   if (IS_LOCKED(lock_val)) {
     return false;
   }
-  *value = v_page.data[slot].second;
+  if constexpr (std::is_same<V, std::string>::value)
+  {
+    memcpy(&((*value)[0]), v_page.data[slot].second.c_str(), v_page.data[slot].second.length());
+  }
+  else
+  {
+    *value = v_page.data[slot].second;
+  }
   return lock_val == page_lock.load(LOAD_ORDER);
 }
 

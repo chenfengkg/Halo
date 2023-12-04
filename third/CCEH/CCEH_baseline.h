@@ -36,6 +36,9 @@ deadlock caused by sudden system failure.
 #define EPOCH 1
 #define LOG_NUM 1024
 
+std::atomic<uint64_t> cceh_write_count{0};
+std::atomic<uint64_t> cceh_write_count1{0};
+
 namespace cceh {
 
 template <class T>
@@ -340,6 +343,7 @@ class CCEH {
   Value_t FindAnyway(T);
   double Utilization(void);
   size_t Capacity(void);
+  std::pair<size_t, size_t> SpaceConsumption();
   void Recovery(void);
   void Directory_Doubling(int x, Segment<T> *s0, PMEMoid *s1);
   void Directory_Update(int x, Segment<T> *s0, PMEMoid *s1);
@@ -357,6 +361,19 @@ class CCEH {
 #endif
 };
 //#endif  // EXTENDIBLE_PTR_H_
+template <class T>
+std::pair<size_t, size_t> CCEH<T>::SpaceConsumption()
+{
+  std::unordered_map<Segment<T> *, bool> umap;
+  auto sa = dir->sa;
+  for (size_t i = 0; i < dir->capacity; i++)
+  {
+    umap[sa->_[i]] = true;
+  }
+  size_t total_pmem = sizeof(CCEH<T>) + umap.size() * sizeof(Segment<T>) +
+                      sizeof(Directory<T>) + sizeof(Segment<T> *) * dir->capacity;
+  return {0, total_pmem};
+}
 
 template <class T>
 int Segment<T>::Insert(PMEMobjpool *pool_addr, T key, Value_t value, size_t loc,
@@ -404,6 +421,7 @@ int Segment<T>::Insert(PMEMobjpool *pool_addr, T key, Value_t value, size_t loc,
         _[slot].value = value;
         _[slot].key = key;
         Allocator::Persist(&_[slot], sizeof(_Pair<T>));
+        // cceh_write_count++;
         ret = 0;
         break;
       } else {
@@ -418,6 +436,7 @@ int Segment<T>::Insert(PMEMobjpool *pool_addr, T key, Value_t value, size_t loc,
         _[slot].value = value;
         _[slot].key = key;
         Allocator::Persist(&_[slot], sizeof(_Pair<T>));
+        // cceh_write_count++;
         ret = 0;
         break;
       } else {
@@ -477,6 +496,7 @@ PMEMoid *Segment<T>::Split(PMEMobjpool *pool_addr, size_t key_hash,
       if constexpr (std::is_pointer_v<T>) {
         _[i].key = (T)INVALID;
       }
+      // cceh_write_count1 += 2;
     }
   }
 
@@ -701,6 +721,7 @@ RETRY:
     ss->pattern =
         ((key_hash >> (8 * sizeof(key_hash) - ss->local_depth + 1)) << 1) + 1;
     Allocator::Persist(&ss->pattern, sizeof(ss->pattern));
+    // cceh_write_count++;
 
     // Directory management
     Lock_Directory();
@@ -720,6 +741,7 @@ RETRY:
       Allocator::Persist(&target->pattern, sizeof(target->pattern));
       target->local_depth += 1;
       Allocator::Persist(&target->local_depth, sizeof(target->local_depth));
+      // cceh_write_count += 2;
 #ifdef INPLACE
       target->sema = 0;
       target->release_lock(pool_addr);

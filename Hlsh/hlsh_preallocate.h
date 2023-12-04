@@ -1,7 +1,8 @@
 #include "hlsh_bucket.h"
 namespace HLSH_hashing
 {
-
+    // #define DRAM_USAGE
+    std::atomic<uint64_t> remaining_chunk{0};
     thread_local void *tl_schunk = nullptr; // segchunk
 
     constexpr size_t kSegNumInOneChunk = 5;
@@ -50,6 +51,9 @@ namespace HLSH_hashing
             {
                 printf("allocate new segment failure!\n");
             }
+#ifdef DRAM_USAGE
+            remaining_chunk += kSegNumInOneChunk;
+#endif
             return sc;
         }
 
@@ -75,6 +79,9 @@ namespace HLSH_hashing
                     next = AllocateNewChunk();
                 }
             }
+#ifdef DRAM_USAGE
+            remaining_chunk--;
+#endif
             return s;
         }
     };

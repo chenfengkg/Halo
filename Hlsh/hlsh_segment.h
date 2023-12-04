@@ -16,7 +16,7 @@ namespace HLSH_hashing
     PersistHash<KEY,VALUE>* ph; //8B
     uint64_t pattern : 58; // 8B
     uint64_t local_depth : 6;
-    uint64_t pad[5];
+    uint64_t pad[5]; //40B
     SpareBucket<KEY, VALUE> sbucket;
     Bucket<KEY, VALUE> bucket[kNumBucket];
 
@@ -197,11 +197,13 @@ namespace HLSH_hashing
       t->lock.ReleaseLock();
       return rSegmentChanged;
     }
+#ifndef DRAM_INDEX
     // s2: insert key-value to pm
     if (tl_value == PO_NULL)
     {
       tl_value = pm->Insert(p, thread_id);
     }
+#endif
     // s: insert to target bucket
     auto r = t->Insert(key_hash, tl_value, finger, &sbucket);
     // s: release lock
@@ -238,8 +240,11 @@ namespace HLSH_hashing
     t->lock.GetLock();
     if (t->lock.VersionIsChanged2(old_version))
     {
-      t->lock.ReleaseLock();
-      goto RETRY;
+      if (!t->CheckKey(p, key_hash, &sbucket, pos))
+      {
+        t->lock.ReleaseLock();
+        goto RETRY;
+      }
     }
     // s: judge whether segment has been split
     if (this != index->GetSegment(key_hash))
@@ -282,8 +287,11 @@ namespace HLSH_hashing
     t->lock.GetLock();
     if (t->lock.VersionIsChanged2(old_version))
     {
-      t->lock.ReleaseLock();
-      goto RETRY;
+      if (!t->CheckKey(p, key_hash, &sbucket, pos))
+      {
+        t->lock.ReleaseLock();
+        goto RETRY;
+      }
     }
     // s: judge whether segment has been split
     if (this != index->GetSegment(key_hash))
@@ -292,7 +300,7 @@ namespace HLSH_hashing
       return rSegmentChanged;
     }
     // s: update
-    auto r = t->Update(p, key_hash, finger, pm, thread_id,
+    auto r = t->Update(p, key_hash, pm, thread_id,
                        &sbucket, pos);
     // s: release lock
     t->lock.ReleaseLock();
@@ -361,13 +369,13 @@ namespace HLSH_hashing
     // s2: get version
     auto old_version = target->lock.GetVersion();
     // s3: get and return value from target bucket if value exist
-    auto r = target->Get(p, key_hash, finger, &sbucket);
+    target->Get(p, key_hash, finger, &sbucket);
     //  s4.1: retry if version change or return
     if (target->lock.VersionIsChanged(old_version))
     {
       goto RETRY;
     }
-    return r;
+    return true;
   }
 
   /* Split target buckets*/
@@ -422,11 +430,11 @@ namespace HLSH_hashing
       {
         if (CHECK_BIT(sb->sbitmap, j))
         {
-          auto pos = sb->spos[j].spos;
+          auto pos = sb->spos[j];
           if (((ssb->_[pos].hkey) >> (64 - local_depth)) == new_pattern)
           {
             nb->Insert(ssb->_[pos].hkey, ssb->_[pos].value,
-                       sb->spos[j].finger, &new_seg->sbucket);
+                       sb->sfinger[j], &new_seg->sbucket);
             SET_BIT8(invalid_mask8, j);
             ssb->ClearBit(pos);
           }

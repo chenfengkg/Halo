@@ -96,12 +96,14 @@ class Pair_t<KEY, std::string> {
   KEY _key;
   uint32_t _vlen;
   std::string svalue;
+
   Pair_t() {
     op = 0;
     version = 0;
     _vlen = 0;
     svalue.reserve(MAX_VALUE_LEN);
   };
+
   Pair_t(char *p) {
     auto pt = reinterpret_cast<Pair_t *>(p);
     _key = pt->_key;
@@ -111,7 +113,9 @@ class Pair_t<KEY, std::string> {
     svalue.assign(p + sizeof(KEY) + sizeof(uint32_t) + sizeof(OP_VERSION),
                   _vlen);
   }
-  void load(char *p) {
+
+  void load(char *p)
+  {
     auto pt = reinterpret_cast<Pair_t *>(p);
     _key = pt->_key;
     op = pt->op;
@@ -120,6 +124,7 @@ class Pair_t<KEY, std::string> {
     svalue.assign(p + sizeof(KEY) + sizeof(uint32_t) + sizeof(OP_VERSION),
                   _vlen);
   }
+
   size_t klen() { return sizeof(KEY); }
   KEY *key() { return &_key; }
   KEY str_key() { return _key; }

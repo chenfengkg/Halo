@@ -31,6 +31,15 @@ namespace HLSH_hashing
 
   constexpr size_t bucketMask = kNumBucket - 1;
 
+  constexpr size_t PrefetchNum = 12;
+// #define DRAM_INDEX
+// #define READ_BUFFER
+
+#ifdef READ_BUFFER
+  thread_local char* RBUFFER[PrefetchNum];
+  thread_local char* RADDRS[PrefetchNum];
+#endif
+
   std::atomic<uint64_t> count = {0};
   std::atomic<uint64_t> count1 = {0};
   std::atomic<uint64_t> count2 = {0};
@@ -38,26 +47,7 @@ namespace HLSH_hashing
   std::atomic<uint64_t> count4 = {0};
   std::atomic<uint64_t> count5 = {0};
 
-  struct PrefetchValue
-  {
-    char *ok;               // origin kv
-    std::vector<char *> kp; // possible key
 
-    PrefetchValue()
-    {
-      ok = nullptr;
-    }
-
-    void Clear()
-    {
-      ok = nullptr;
-      kp.clear();
-    }
-  };
-
-  // constexpr size_t PrefetchNum = 12;
-  constexpr size_t PrefetchNum = 12;
-  thread_local PrefetchValue pv[PrefetchNum];
   thread_local size_t GetNum = 0;
 
   struct _Pair
@@ -110,7 +100,7 @@ namespace HLSH_hashing
     Lock8 lock[kSpareBucketNum]; // 8B
     uint8_t pad[8 - kSpareBucketNum];
     Bitmap bitmap[kSpareBucketNum];     // 56B
-    uint64_t pad1[7 - kSpareBucketNum]; // 24B
+    uint64_t pad1[7 - kSpareBucketNum]; 
     _Pair _[kSparePairNum];
 
     static size_t GetSize() { return kSparePairNum; }
@@ -168,20 +158,29 @@ namespace HLSH_hashing
                 uint64_t position, PmManage<KEY, VALUE> *pm)
     {
       // s1: delete kv for varied-length kv
-      if (_[position].hkey == key_hash)
+#ifndef DRAM_INDEX
+      pm->Delete(_[position].value);
+#endif
+      auto m = position >> 6;
+      lock[m].GetLock();
+      bitmap[m].UnsetBit(position & 63);
+      lock[m].ReleaseLock();
+      return true;
+    }
+
+    inline bool CheckKey(Pair_t<KEY, VALUE> *p, uint64_t key_hash,
+                         uint64_t pos)
+    {
+      if (_[pos].hkey == key_hash)
       {
-        auto o = _[position].value;
-        auto v = reinterpret_cast<Pair_t<KEY, VALUE> *>(o.GetValue());
-        // s1.1 delete kv if key is equal
-        if (v->str_key() == p->str_key())
-        {
-          pm->Delete(_[position].value);
-          auto m = position >> 6;
-          lock[m].GetLock();
-          bitmap[m].UnsetBit(position & 63);
-          lock[m].ReleaseLock();
+#ifdef DRAM_INDEX
+        return true;
+#else
+        auto v = reinterpret_cast<Pair_t<KEY, VALUE> *>(
+            _[pos].value.GetValue());
+        if (v->cmp_key(p))
           return true;
-        }
+#endif
       }
       return false;
     }
@@ -191,12 +190,16 @@ namespace HLSH_hashing
     {
       if (_[pos].hkey == key_hash)
       {
-        auto o = _[pos].value;
-        auto v = reinterpret_cast<Pair_t<KEY, VALUE> *>(o.GetValue());
-        if (v->str_key() == p->str_key())
+#ifdef DRAM_INDEX
+        return true;
+#else
+        auto v = reinterpret_cast<Pair_t<KEY, VALUE> *>(
+            _[pos].value.GetValue());
+        if (v->cmp_key(p))
         {
           return true;
         }
+#endif
       }
       return false;
     }
@@ -205,16 +208,20 @@ namespace HLSH_hashing
     {
       if (_[pos].hkey == key_hash)
       {
-        auto o = _[pos].value;
-        // auto addr = reinterpret_cast<char *>(o.chunk_start_addr + o.offset);
-        // pv[GetNum].kp.push_back(addr);
-        // _mm_prefetch(addr,_MM_HINT_NTA);
-        auto v = reinterpret_cast<Pair_t<KEY, VALUE> *>(o.GetValue());
-        if (v->str_key() == p->str_key())
+#ifdef DRAM_INDEX
+        return true;
+#else
+#ifdef READ_BUFFER
+        RADDRS[GetNum] = GETP_CHAR(_[pos].value.GetValue());
+        _mm_prefetch(RADDRS[GetNum], _MM_HINT_NTA);
+        return true;
+#endif
+        auto v = GETP_PAIR(_[pos].value.GetValue());
+        if (v->cmp_key_and_load(p))
         {
-          p->load((char *)v);
           return true;
         }
+#endif
       }
       return false;
     }
@@ -222,18 +229,13 @@ namespace HLSH_hashing
     inline bool Update(Pair_t<KEY, VALUE> *p, uint64_t key_hash, size_t thread_id,
                        uint64_t position, PmManage<KEY, VALUE> *pm)
     {
-      if (_[position].hkey == key_hash)
-      {
-        // s2.1.1: obtain pointer to kv
-        auto o = _[position].value;
-        auto v = reinterpret_cast<Pair_t<KEY, VALUE> *>(o.GetValue());
-        if (p->str_key() == v->str_key())
-        {
-          _[position].value = pm->Update(p, thread_id, _[position].value);
-          return true;
-        }
-      }
-      return false;
+      // s2.1.1: obtain pointer to kv
+#ifdef DRAM_INDEX
+      _[position].value = _[position].value;
+#else
+      _[position].value = pm->Update(p, thread_id, _[position].value);
+#endif
+      return true;
     }
 
     inline bool UpdateForReclaim(Pair_t<KEY, VALUE> *p, uint64_t key_hash,
@@ -268,8 +270,9 @@ namespace HLSH_hashing
     uint8_t fingers[12];                  // 12
     _Pair slot[kBucketNormalSlotNum];     // 6*16B
     uint8_t sbitmap;  // 1B
+    uint8_t sfinger[7]; //7B
+    uint8_t spos[7];    // 7B
     uint8_t pad;  //1B
-    FSPos spos[7];   // 14B
 
     Bucket() {}
 
@@ -300,50 +303,55 @@ namespace HLSH_hashing
     {
       // s: compare finger with SIMD
       auto mask = CMP128(fingers, finger);
-      MASK(mask, 12);
       // s: filter with bitmap
       mask &= bitmap;
       // s: find duplicate kv
-      if (mask)
+      while (mask)
       {
-        do
+        auto pos = __builtin_ctz(mask);
+        if (pos >= 12)
+          break;
+        if (pos < kBucketNormalSlotNum)
         {
-          auto pos = __builtin_ctz(mask);
-          if (pos < kBucketNormalSlotNum)
+          if (slot[pos].hkey == key_hash)
           {
-            if (slot[pos].hkey == key_hash)
+            // s: search in normal bucket
+#ifdef DRAM_INDEX
+            return true;
+#else
+            auto v = reinterpret_cast<Pair_t<KEY, VALUE> *>(
+                slot[pos].value.GetValue());
+            if (v->cmp_key(p))
             {
-              // s: search in normal bucket
-              auto o = slot[pos].value;
-              auto v = reinterpret_cast<Pair_t<KEY, VALUE> *>(o.GetValue());
-              if (p->str_key() == v->str_key())
-              {
-                return pos;
-              }
-            }
-          }
-          else if (pos < 12)
-          {
-            // s: search in spare bucket
-            auto r = sb->FindDuplicate(p, key_hash, slot[pos - kBucketNormalSlotNum].value.spos);
-            if (r)
               return pos;
+            }
+#endif
           }
-          UNSET_BIT16(mask, pos);
-        } while (mask);
+        }
+        else
+        {
+          // s: search in spare bucket
+          auto r = sb->FindDuplicate(p, key_hash, slot[pos - kBucketNormalSlotNum].value.spos);
+          if (r)
+            return pos;
+        }
+        UNSET_BIT16(mask, pos);
       }
       // s: check spare slot
       if (CHECK_BIT(bitmap, 12))
       {
-        for (size_t i = 0; i < 7; i++)
+        auto mask = CMP64(sfinger, finger);
+        mask &= sbitmap;
+        while (mask)
         {
-          if (CHECK_BIT(sbitmap, i) && spos[i].finger == finger)
+          auto pos = __builtin_ctz(mask);
+          if (pos >= 7)
+            break;
+          if (sb->FindDuplicate(p, key_hash, spos[pos]))
           {
-            // s: search in spare bucket
-            auto r = sb->FindDuplicate(p, key_hash, spos[i].spos);
-            if (r)
-              return (12 + i);
+            return (12 + pos);
           }
+          UNSET_BIT8(mask, pos);
         }
       }
       return rFailure;
@@ -373,37 +381,36 @@ namespace HLSH_hashing
       {
         // s: search in spare bucket
         sb->UpdateForReclaim(p, key_hash, old_value, new_value,
-                             spos[pos - 12].spos, pm);
+                             spos[pos - 12], pm);
       }
       pm->Delete(old_value);
       return true;
     }
 
     bool Update(Pair_t<KEY, VALUE> *p, uint64_t key_hash,
-                uint8_t finger, PmManage<KEY, VALUE> *pm,
-                size_t thread_id, SpareBucket<KEY, VALUE> *sb,
-                int pos)
+                PmManage<KEY, VALUE> *pm, size_t thread_id,
+                SpareBucket<KEY, VALUE> *sb, int pos)
     {
       if (pos < kBucketNormalSlotNum)
       {
         // s: search in normal bucket
-        auto o = slot[pos].value;
-        auto v = reinterpret_cast<Pair_t<KEY, VALUE> *>(o.GetValue());
-        if (p->str_key() == v->str_key())
-        {
-          slot[pos].value = pm->Update(p, thread_id, slot[pos].value);
-        }
+#ifdef DRAM_INDEX
+        slot[pos].value = slot[pos].value;
+#else
+        slot[pos].value = pm->Update(p, thread_id, slot[pos].value);
+#endif
       }
       else if (pos < 12)
       {
         // s: search in spare bucket
+        auto rpos = pos - kBucketNormalSlotNum;
         sb->Update(p, key_hash, thread_id,
-                   slot[pos - kBucketNormalSlotNum].value.spos, pm);
+                   slot[rpos].value.spos, pm);
       }
       else
       {
         // s: search in spare bucket
-        sb->Update(p, key_hash, thread_id, spos[pos - 12].spos, pm);
+        sb->Update(p, key_hash, thread_id, spos[pos - 12], pm);
       }
       return true;
     }
@@ -413,59 +420,64 @@ namespace HLSH_hashing
     {
       // s: compare finger with SIMD
       auto mask = CMP128(fingers, finger);
-      MASK(mask, 12);
       // s: filter with bitmap
       mask &= bitmap;
       /* s: search normal and spare bucket */
-      if (mask)
+      while (mask)
       {
-        do
+        auto pos = __builtin_ctz(mask);
+        if (pos >= 12)
+          break;
+        if (pos < kBucketNormalSlotNum)
         {
-          auto pos = __builtin_ctz(mask);
-          if (pos < kBucketNormalSlotNum)
+          if (slot[pos].hkey == key_hash)
           {
-            if (slot[pos].hkey == key_hash)
-            {
-              // s: search in normal bucket
-              auto o = slot[pos].value;
-              auto v = reinterpret_cast<Pair_t<KEY, VALUE> *>(o.GetValue());
-              if (p->str_key() == v->str_key())
-              {
-                p->load((char *)(v));
-                return true;
-              }
-            }
-          }
-          else if (pos < 12)
-          {
-            // s: search in spare bucket
-            auto r = sb->Get(p, key_hash, slot[pos - kBucketNormalSlotNum].value.spos);
-            if (r)
+            // s: search in normal bucket
+#ifdef DRAM_INDEX
+            return true;
+#else
+#ifdef READ_BUFFER
+            RADDRS[GetNum] = GETP_CHAR(slot[pos].value.GetValue());
+            _mm_prefetch(RADDRS[GetNum], _MM_HINT_NTA);
+            return true;
+#else
+            auto v = GETP_PAIR(slot[pos].value.GetValue());
+            if (v->cmp_key_and_load(p))
             {
               return true;
             }
-          }
-          UNSET_BIT16(mask, pos);
-        } while (UNLIKELY(mask));
-      }
-      // s: check spare slot
-      if (UNLIKELY(CHECK_BIT(bitmap, 12)))
-      {
-        for (size_t i = 0; i < 7; i++)
-        {
-          if (CHECK_BIT(sbitmap, i) &&
-              spos[i].finger == finger)
-          {
-            // s: search in spare bucket
-            auto r = sb->Get(p, key_hash, spos[i].spos);
-            if (r)
-            {
-              return rSuccess;
-            }
+#endif
+#endif
           }
         }
+        else
+        {
+          // s: search in spare bucket
+          auto rpos = pos - kBucketNormalSlotNum;
+          if (sb->Get(p, key_hash, slot[rpos].value.spos))
+          {
+            return true;
+          }
+        }
+        UNSET_BIT16(mask, pos);
       }
-      return false;
+      // s: check spare slot
+      if (CHECK_BIT(bitmap, 12))
+      {
+        auto mask = CMP64(sfinger, finger);
+        mask &= sbitmap;
+        while(mask){
+          auto pos = __builtin_ctz(mask);
+          if (pos >= 7)
+            break;
+          if (sb->Get(p, key_hash, spos[pos]))
+          {
+            return true;
+          }
+          UNSET_BIT8(mask, pos);
+        }
+      }
+      return rFailure;
     }
 
     inline int FindEmptySlot()
@@ -515,8 +527,8 @@ namespace HLSH_hashing
           else
           {
             auto q = pos - 12;
-            spos[q].finger = finger;
-            spos[q].spos = k;
+            sfinger[q]= finger;
+            spos[q] = k;
             SET_BIT8(sbitmap, q);
             SET_BIT16(bitmap, 12);
           }
@@ -529,6 +541,42 @@ namespace HLSH_hashing
       return rSuccess;
     }
 
+    bool CheckKey(Pair_t<KEY, VALUE> *p, uint64_t key_hash,
+                  SpareBucket<KEY, VALUE> *sb, int pos)
+    {
+      if (pos < kBucketNormalSlotNum)
+      {
+        if (CHECK_BIT(bitmap, pos) && slot[pos].hkey == key_hash)
+        {
+#ifdef DRAM_INDEX
+          return true;
+#else
+          auto v = reinterpret_cast<Pair_t<KEY, VALUE> *>(
+              slot[pos].value.GetValue());
+          if (v->cmp_key(p))
+            return true;
+#endif
+        }
+      }
+      else if (pos < 12)
+      {
+        if (CHECK_BIT(bitmap, pos))
+        {
+          auto rpos = pos - kBucketNormalSlotNum;
+          return sb->CheckKey(p, key_hash, slot[rpos].value.spos);
+        }
+      }
+      else
+      {
+        auto rpos = pos - 12;
+        if (CHECK_BIT(sbitmap, rpos))
+        {
+          return sb->CheckKey(p, key_hash, spos[rpos]);
+        }
+      }
+      return false;
+    }
+
     /*if delete success, then return 0, else return -1*/
     bool Delete(Pair_t<KEY, VALUE> *p, uint64_t key_hash,
                 uint8_t finger, PmManage<KEY, VALUE> *pm,
@@ -537,34 +585,25 @@ namespace HLSH_hashing
       if (pos < kBucketNormalSlotNum)
       {
         // s: search in normal bucket
-        auto o = slot[pos].value;
-        auto v = reinterpret_cast<Pair_t<KEY, VALUE> *>(o.GetValue());
-        if (p->str_key() == v->str_key())
-        {
-          UNSET_BIT16(bitmap, pos);
-          pm->Delete(slot[pos].value);
-        }
+#ifndef DRAM_INDEX
+        pm->Delete(slot[pos].value);
+#endif
+        UNSET_BIT16(bitmap, pos);
       }
       else if (pos < 12)
       {
         // s: search in spare bucket
-        auto r = sb->Delete(p, key_hash, slot[pos - kBucketNormalSlotNum].value.spos, pm);
-        if (r)
-        {
-          UNSET_BIT16(bitmap, pos);
-        }
+        sb->Delete(p, key_hash, slot[pos - kBucketNormalSlotNum].value.spos, pm);
+        UNSET_BIT16(bitmap, pos);
       }
       else
       {
         // s: search in spare bucket
-        auto r = sb->Delete(p, key_hash, spos[pos - 12].spos, pm);
-        if (r)
+        sb->Delete(p, key_hash, spos[pos - 12], pm);
+        UNSET_BIT8(sbitmap, (pos - 12));
+        if (!sbitmap)
         {
-          UNSET_BIT8(sbitmap, (pos - 12));
-          if (!sbitmap)
-          {
-            UNSET_BIT16(bitmap, 12);
-          }
+          UNSET_BIT16(bitmap, 12);
         }
       }
       return true;

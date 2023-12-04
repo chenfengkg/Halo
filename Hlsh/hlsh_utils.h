@@ -42,7 +42,7 @@ namespace HLSH_hashing {
   sched_setaffinity(0, sizeof(cpu_set_t), &my_set);
 }
 
-static inline size_t h(const void* key, size_t len, size_t seed = 0xc70697UL) {
+static inline size_t h(const void* key, size_t len, size_t seed = 0xc70f6907UL) {
   return std::_Hash_bytes(key, len, seed);
 }
 
@@ -173,8 +173,6 @@ inline uint16_t CMP128(uint8_t src[], uint8_t key)
     __m128i rv_mask = _mm_cmpeq_epi8(seg_data, key_data);                      \
     mask = _mm_movemask_epi8(rv_mask);                                         \
   }while(0)
-
-    // mask = _mm_cmpeq_epi8_mask(seg_data,key_data);\
 
 // 256 bytes
 #define SIMD_CMP8(src, key)                                        \

@@ -18,6 +18,8 @@ using namespace std;
 using namespace pcm;
 // #define LATENCY
 // #define PM_PCM
+// #define SPACE_CONSUMPTION
+
 enum { OP_INSERT, OP_READ, OP_DELETE, OP_UPDATE };
 
 enum workload_type {
@@ -41,7 +43,8 @@ uint64_t MAX_SIZE_LOAD = 0ULL;
 uint64_t MAX_SIZE_RUN = 0ULL;
 
 void run_test(workload_type wlt, int num_thread, string load_data,
-              string run_data, hash_api *&h, string workload) {
+              string run_data, hash_api *&h, string workload, int value_len)
+{
   char values[] =
       "NvhE8N7yR26f4bbpMJnUKgHncH6QbsI10HyxlvYHKFiMk5nPNDbueF2xKLzteSd0NazU2APk"
       "JWXvBW2oUu8dkZnWMMu37G8TH2qm"
@@ -78,7 +81,6 @@ void run_test(workload_type wlt, int num_thread, string load_data,
 
   // string op;
   // uint64_t key;
-  // uint64_t value_len;
   vector<uint64_t> init_keys(MAX_SIZE_LOAD);
   vector<uint64_t> init_value_lens(MAX_SIZE_LOAD);
   vector<uint64_t> keys(MAX_SIZE_RUN);
@@ -105,7 +107,8 @@ void run_test(workload_type wlt, int num_thread, string load_data,
       stringstream ss(line);
       ss >> o >> k >> len;
       init_keys[i] = k;
-      init_value_lens[i] = len;
+      // init_value_lens[i] = len;
+      init_value_lens[i] = value_len;
     }
     // s: close file
     infile.close();
@@ -153,14 +156,16 @@ void run_test(workload_type wlt, int num_thread, string load_data,
         ss >> len;
         ops[i] = OP_INSERT;
         keys[i] = k;
-        value_lens[i] = len;
+        // value_lens[i] = len;
+        value_lens[i] = value_len;
       }
       else if (o.compare(update) == 0)
       {
         ss >> len;
         ops[i] = OP_UPDATE;
         keys[i] = k;
-        value_lens[i] = len;
+        // value_lens[i] = len;
+        value_lens[i] = value_len;
       }
       else if (o.compare(read) == 0)
       {
@@ -205,6 +210,14 @@ void run_test(workload_type wlt, int num_thread, string load_data,
 #else
   Pair_t<std::string, std::string> *p =
       new Pair_t<std::string, std::string>[RUN_SIZE];
+#endif
+#elif defined(VIPERT)
+#ifndef NONVAR
+  std::string *p = new std::string[RUN_SIZE];
+  for (size_t i = 0; i < RUN_SIZE; i++)
+  {
+    p[i].reserve(512);
+  }
 #endif
 #endif
   printf("Loaded %d keys for running.\n", count);
@@ -252,9 +265,9 @@ void run_test(workload_type wlt, int num_thread, string load_data,
       h->wait();
 #endif
     };
-#ifdef PM_PCM
-    auto before_state = getSystemCounterState();
-#endif
+// #ifdef PM_PCM
+//     auto before_state = getSystemCounterState();
+// #endif
     for (size_t i = 0; i < num_thread; i++) {
       if (i < (num_thread - 1))
         ths[i] = thread(insert, part * i, part, i);
@@ -267,19 +280,27 @@ void run_test(workload_type wlt, int num_thread, string load_data,
     auto t = sw.elapsed<std::chrono::milliseconds>();
     printf("Throughput: load, %f Mops/s\n",
            (LOAD_SIZE / 1000000.0) / (t / 1000.0));
-#ifdef PM_PCM
-    auto after_sstate = getSystemCounterState();
-    cout << "MB ReadFromPMM: "
-         << getBytesReadFromPMM(before_state, after_sstate) / 1000000 << " "
-         << (getBytesReadFromPMM(before_state, after_sstate) / 1000000.0) /
-                (t / 1000.0)
-         << " MB/s" << endl;
-    cout << "MB WrittenToPMM: "
-         << getBytesWrittenToPMM(before_state, after_sstate) / 1000000 << " "
-         << (getBytesWrittenToPMM(before_state, after_sstate) / 1000000.0) /
-                (t / 1000.0)
-         << " MB/s" << endl;
+#ifdef SOFTT
+    // recovery data
+    // Timer rt;
+    // rt.start();
+    // h->recovery();
+    // auto dt = rt.elapsed<std::chrono::milliseconds>();
+    // printf("SOFT recovery time: %f\n", dt);
 #endif
+// #ifdef PM_PCM
+  // auto after_sstate = getSystemCounterState();
+  // cout << "MB ReadFromPMM: "
+  //      << getBytesReadFromPMM(before_state, after_sstate) / (1024 * 1024) << " "
+  //      << (getBytesReadFromPMM(before_state, after_sstate) / (1024.0 * 1024.0)) /
+  //             (t / 1000.0)
+  //      << " MB/s" << endl;
+  // cout << "MB WrittenToPMM: "
+  //      << getBytesWrittenToPMM(before_state, after_sstate) / (1024 * 1024) << " "
+  //      << (getBytesWrittenToPMM(before_state, after_sstate) / (1024.0 * 1024.0)) /
+  //             (t / 1000.0)
+  //      << " MB/s" << endl;
+// #endif
   }
 
   part = RUN_SIZE / num_thread;
@@ -305,8 +326,12 @@ void run_test(workload_type wlt, int num_thread, string load_data,
       } else if (ops[i] == OP_UPDATE) {
         h->update(keys[i], value_lens[i], reinterpret_cast<char *>(values), c);
       } else if (ops[i] == OP_READ) {
+#ifdef NONVAR
         uint64_t v;
         auto r = h->find(keys[i], c, &v);
+#else
+        auto r = h->find(keys[i], c, &p[i]);
+#endif
       } else if (ops[i] == OP_DELETE) {
         h->erase(keys[i], c);
       }
@@ -314,19 +339,18 @@ void run_test(workload_type wlt, int num_thread, string load_data,
       latency.push_back(l.elapsed<std::chrono::nanoseconds>());
 #endif
     }
-    h->load_factor(c);
 #else
 #ifdef LATENCY
-#ifdef HALOT
-    l.start();
-#endif
+// #ifdef HALOT
+//     l.start();
+// #endif
 #endif
     bool rf = false;
     for (size_t i = start; i < end; i++) {
 #ifdef LATENCY
-#ifndef HALOT
+// #ifndef HALOT
       l.start();
-#endif
+// #endif
 #endif
       if (ops[i] == OP_INSERT) {
         rf = h->insert(keys[i], value_lens[i], reinterpret_cast<char *>(values),
@@ -345,15 +369,15 @@ void run_test(workload_type wlt, int num_thread, string load_data,
         rf = true;
       }
 #ifdef LATENCY
-#ifndef HALOT
+// #ifndef HALOT
       latency.push_back(l.elapsed<std::chrono::nanoseconds>());
-#else
-      if (rf) {
-        latency.push_back(l.elapsed<std::chrono::nanoseconds>());
-        rf = false;
-        l.start();
-      }
-#endif
+// #else
+      // if (rf) {
+      //   latency.push_back(l.elapsed<std::chrono::nanoseconds>());
+      //   rf = false;
+      //   l.start();
+      // }
+// #endif
 
 #endif
     }
@@ -384,20 +408,20 @@ void run_test(workload_type wlt, int num_thread, string load_data,
 
   printf("Throughput: run, %f Mops/s\n",
          ((RUN_SIZE * 1.0) / 1000000) / (t / 1000));
-#ifdef HALOT
-  h->load_factor();
+#ifdef SPACE_CONSUMPTION
+  h->space_consumption();
 #endif
 
 #ifdef PM_PCM
   auto after_sstate = getSystemCounterState();
   cout << "MB ReadFromPMM: "
-       << getBytesReadFromPMM(before_state, after_sstate) / 1000000 << " "
-       << (getBytesReadFromPMM(before_state, after_sstate) / 1000000.0) /
+       << getBytesReadFromPMM(before_state, after_sstate) / (1024 * 1024) << " "
+       << (getBytesReadFromPMM(before_state, after_sstate) / (1024.0 * 1024.0)) /
               (t / 1000.0)
        << " MB/s" << endl;
   cout << "MB WrittenToPMM: "
-       << getBytesWrittenToPMM(before_state, after_sstate) / 1000000 << " "
-       << (getBytesWrittenToPMM(before_state, after_sstate) / 1000000.0) /
+       << getBytesWrittenToPMM(before_state, after_sstate) / (1024 * 1024) << " "
+       << (getBytesWrittenToPMM(before_state, after_sstate) / (1024.0 * 1024.0)) /
               (t / 1000.0)
        << " MB/s" << endl;
 #endif
@@ -422,7 +446,7 @@ void run_test(workload_type wlt, int num_thread, string load_data,
 #endif
   delete[] r;
 
-#ifdef HALOT
+#if defined(HALOT)||defined(HLSHT) 
   delete[] p;
 #endif
 }
@@ -444,6 +468,7 @@ int main(int argc, char **argv) {
   char* end;
   MAX_SIZE_LOAD = strtol(argv[3], &end, 10) * 1000000;
   MAX_SIZE_RUN = strtol(argv[4], &end, 10) * 1000000;
+  int value_len = atoi(argv[5]);
   string workload = argv[1];
   workload_type wlt;
   string load_data = "";
@@ -465,7 +490,7 @@ int main(int argc, char **argv) {
   }
   int num_thread = atoi(argv[2]);
   hash_api *h;
-  run_test(wlt, num_thread, load_data, run_data, h, workload);
+  run_test(wlt, num_thread, load_data, run_data, h, workload, value_len);
 #ifdef SOFTT
   vmem_stats_print(vmp1, "");
 #elif PCLHTT

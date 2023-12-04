@@ -25,6 +25,9 @@
 namespace HALO {
 using namespace std;
 
+// #define DRAM_INDEX
+#define NO_READ_BUFFER
+
 #define ALIGNED(N) __attribute__((aligned(N)))
 #define Likely(x) __builtin_expect((x), 1)
 #define Unlikely(x) __builtin_expect((x), 0)
@@ -33,8 +36,8 @@ using namespace std;
 #define GET_CLHT_INDEX(kh, n) ((kh >> 56) % n)
 #define ROUND_UP(s, n) (((s) + (n)-1) & (~(n - 1)))
 constexpr size_t MAX_BATCHING_SIZE = 256;
-// constexpr size_t READ_BUFFER_SIZE = 16 /* Pairs */;
-constexpr size_t READ_BUFFER_SIZE = 1 /* Pairs */;
+constexpr size_t READ_BUFFER_SIZE = 16 /* Pairs */;
+// constexpr size_t READ_BUFFER_SIZE = 1 /* Pairs */;
 
 using clht_val_t = volatile size_t;
 using clht_lock_t = volatile uint8_t;
@@ -95,6 +98,7 @@ constexpr bool LOGCLEAN = false;
 extern std::atomic<uint64_t> halo_count;
 extern std::atomic<uint64_t> halo_count1;
 extern std::atomic<uint64_t> halo_count2;
+extern std::atomic<uint64_t> halo_count3;
 extern std::atomic<uint64_t> halo_write_count;
 
 constexpr size_t DEAFULT_SEGMENT_SIZE = 16 * 1024 * 1024;
@@ -473,6 +477,10 @@ struct CLHT {
           auto poffset = bucket->val[j];
           bucket->key[j] = INVALID;
           bucket->val[j] = INVALID;
+#ifdef DRAM_INDEX
+          LOCK_RLS(lock);
+          return {0, 0};
+#endif
           auto page_id = poffset / PAGE_SIZE;
           auto addr = reinterpret_cast<char *>(PPage_table[page_id].load() +
                                                poffset % PAGE_SIZE);
@@ -553,7 +561,6 @@ struct CLHT {
     if (resize_lock) ;
     volatile Bucket *bucket = table->buckets + bin;
     uint32_t j;
-    int count = 0;
     do
     {
       for (j = 0; j < ENTRIES_PER_BUCKET; j++)
@@ -563,18 +570,21 @@ struct CLHT {
         {
           if (Likely(bucket->val[j] == val))
           {
+#ifdef DRAM_INDEX
+            return true;
+#else
             auto page_index = val / PAGE_SIZE;
             auto v = reinterpret_cast<Pair_t<KEY, VALUE> *>(PPage_table[page_index].load() +
                                                             val % PAGE_SIZE);
             if (v->str_key() == p->str_key())
             {
-              p->load((char*)v);
+              p->load((char *)v);
               return true;
             }
+#endif
           }
         }
       }
-      count++;
       bucket = (Bucket *)get_DPage_addr(bucket->next);
     } while (Unlikely(bucket != NULL));
     return false;
@@ -1082,24 +1092,25 @@ class Halo {
   ~Halo() {
     for (auto &&i : reclaim_threads) i.join();
     memory_manager_Pool.shutdown(clhts);
-    printf("count: %lu, count1: %lu, count2: %lu, total_count: %lu\n",
-           halo_count.load(), halo_count1.load(), halo_count2.load(),
-           halo_count.load() + halo_count1.load() + halo_count2.load());
+    printf("count: %lu, count1: %lu, count2: %lu, count3: %lu, total_count: %lu\n",
+           halo_count.load(), halo_count1.load(), halo_count2.load(), halo_count3.load(),
+           halo_count.load() + halo_count1.load() + halo_count2.load() + halo_count3.load());
     printf("extra_write_count: %lu\n", halo_write_count.load());
   }
 
   bool Insert(Pair_t<KEY, VALUE> &p, int *r) {
     {
+#ifdef DRAM_INDEX
       // test: test CRHT performance
-      // auto hkey = hash_func(reinterpret_cast<void *>(p.key()), p.klen());
-      // auto n = GET_CLHT_INDEX(hkey, TABLE_NUM);
-      // auto offset = clhts[n]->clht_get(hkey).first;
-      // if (offset == 1)
-      //   return true;
-      // clhts[n]->clht_put(hkey, 1);
-      // return true;
+      auto hkey = hash_func(reinterpret_cast<void *>(p.key()), p.klen());
+      auto n = GET_CLHT_INDEX(hkey, TABLE_NUM);
+      auto offset = clhts[n]->clht_get(hkey).first;
+      if (offset == 1)
+        return true;
+      clhts[n]->clht_put(hkey, 1);
+      return true;
+#endif
     }
-
     if (Unlikely(mmanager.ID == -1))
       memory_manager_Pool.get_PM_MemoryManager(&mmanager);
 
@@ -1183,44 +1194,58 @@ class Halo {
   }
 
   bool Get(Pair_t<KEY, VALUE> *p) {
+#ifdef DRAM_INDEX
+    // test: test CRHT performance
+    auto hkey = hash_func(reinterpret_cast<void *>(p->key()), p->klen());
+    auto n = GET_CLHT_INDEX(hkey, TABLE_NUM);
+    auto r = clhts[n]->clht_get(hkey).first;
+    if (r == 1)
+      return true;
+    return false;
+#endif
     {
-      // test: test CRHT performance
-      // auto hkey = hash_func(reinterpret_cast<void *>(p->key()), p->klen());
-      // auto n = GET_CLHT_INDEX(hkey, TABLE_NUM);
-      // auto r = clhts[n]->clht_get(hkey).first;
-      // if (r == 1)
-      //   return true;
-      // return false;
-    }
-    {
+#ifdef NO_READ_BUFFER
       // test: no read buffer performance
       auto hkey = hash_func(reinterpret_cast<void *>(p->key()), p->klen());
       auto n = GET_CLHT_INDEX(hkey, TABLE_NUM);
       auto r = clhts[n]->clht_get(hkey, p);
       READ_LOCK();
       return r;
-    }
+#endif
+      }
 
-    if (Unlikely(READ_BUFFER_SIZE == 1)) {
-      auto hkey = hash_func(reinterpret_cast<void *>(p->key()), p->klen());
-      auto addr = get_PM_addr(hkey);
-      if (addr) {
-        p->load(addr);
+      if (Unlikely(READ_BUFFER_SIZE == 1))
+      {
+        auto hkey = hash_func(reinterpret_cast<void *>(p->key()), p->klen());
+        auto addr = get_PM_addr(hkey);
+        if (addr)
+        {
+          p->load(addr);
+        }
+        READ_LOCK();
+        return true;
+      }
+      BUFFER_READ[BUFFER_READ_COUNTER++] = p;
+      if (BUFFER_READ_COUNTER == READ_BUFFER_SIZE)
+      {
+        Gets();
+        READ_LOCK();
+        return true;
       }
       READ_LOCK();
-      return true;
+      return false;
     }
-    BUFFER_READ[BUFFER_READ_COUNTER++] = p;
-    if (BUFFER_READ_COUNTER == READ_BUFFER_SIZE) {
-      Gets();
-      READ_LOCK();
+    void get_all() { Gets(); }
+    bool Delete(Pair_t<KEY, VALUE> &p)
+    {
+      {
+#ifdef DRAM_INDEX
+      auto hkey = hash_func(reinterpret_cast<void *>(p.key()), p.klen());
+      auto n = GET_CLHT_INDEX(hkey, TABLE_NUM);
+      clhts[n]->clht_remove(hkey, &p);
       return true;
+#endif
     }
-    READ_LOCK();
-    return false;
-  }
-  void get_all() { Gets(); }
-  bool Delete(Pair_t<KEY, VALUE> &p) {
     auto hkey = hash_func(reinterpret_cast<void *>(p.key()), p.klen());
     auto n = GET_CLHT_INDEX(hkey, TABLE_NUM);
     auto offset = clhts[n]->clht_get(hkey).first;
@@ -1260,6 +1285,28 @@ class Halo {
     // printf("DRAM Allocated by malloc: %.1f GB.\n",
     //        float(b_m) / 1024 / 1024 / 1024);
     // memory_manager_Pool.info();
+  }
+
+  std::pair<size_t,size_t> space_consumption(){
+    size_t total_pmem = 0, total_dram = 0;
+    for (size_t i = 0; i < TABLE_NUM; i++) {
+      auto c = clhts[i];
+      auto t = c->table;
+      total_dram += sizeof(Halo) + sizeof(CLHT) + sizeof(Segment);
+      total_dram += t->num_buckets * sizeof(Bucket);
+      for (size_t j = 0; j < t->num_buckets; j++)
+      {
+        auto b = t->buckets + j;
+        b = (Bucket *)get_DPage_addr(b->next);
+        while (b)
+        {
+          total_dram += sizeof(Bucket);
+          b = (Bucket *)get_DPage_addr(b->next);
+        }
+      }
+    }
+    total_pmem += PM_MemoryManager::PAGE_ID * PAGE_SIZE;
+    return {total_dram, total_pmem};
   }
 
   void wait_all() { do_insert_now(); }
